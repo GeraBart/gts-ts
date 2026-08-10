@@ -100,14 +100,9 @@ export class GTS {
     }
 
     if (entity.isSchema) {
+      // Derivation and trait completeness are both type-level properties, so
+      // /validate-entity applies exactly the same checks as OP#12 (§9.7.5).
       const result = this.store.validateSchemaAgainstParent(id);
-      if (!result.ok) {
-        return { ...result, entity_type: 'schema' };
-      }
-      const traitsResult = this.store.validateEntityTraits(id);
-      if (!traitsResult.ok) {
-        return { ...traitsResult, entity_type: 'schema' };
-      }
       return { ...result, entity_type: 'schema' };
     } else {
       const result = this.store.validateInstance(id);

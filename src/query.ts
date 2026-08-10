@@ -158,8 +158,10 @@ export class GtsQuery {
   }
 
   private static matchesIDPattern(entityID: string, basePattern: string): boolean {
-    // Always use the proper matchIDPattern function which handles wildcards and version matching
-    const matchResult = Gts.matchIDPattern(entityID, basePattern);
+    // Always use the proper matchIDPattern function which handles wildcards and version matching.
+    // A collection query with a chain-suffix wildcard returns the identifiers
+    // derived from the type, not the type itself (spec §10 examples).
+    const matchResult = Gts.matchIDPattern(entityID, basePattern, { chainSuffixMatchesSelf: false });
     return matchResult.match;
   }
 

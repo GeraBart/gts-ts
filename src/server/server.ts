@@ -1,6 +1,7 @@
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { GTS, createJsonEntity } from '../index';
 import { XGtsRefValidator } from '../x-gts-ref';
+import { GtsModifiers } from '../modifiers';
 import {
   ServerConfig,
   EntityResponse,
@@ -13,7 +14,8 @@ import {
   CompatibilityParams,
   CastBody,
   QueryParams,
-  ValidateSchemaBody,
+  ValidateTypeSchemaBody,
+  TypeSchemaRegisterBody,
   ValidateEntityBody,
 } from './types';
 import * as gts from '../index';
@@ -66,7 +68,7 @@ export class GtsServer {
     this.fastify.get('/entities/:id', this.handleGetEntity.bind(this));
     this.fastify.post('/entities', this.handleAddEntity.bind(this));
     this.fastify.post('/entities/bulk', this.handleAddEntities.bind(this));
-    this.fastify.post('/schemas', this.handleAddSchema.bind(this));
+    this.fastify.post('/type-schemas', this.handleAddTypeSchema.bind(this));
 
     // OP#1 - Validate ID
     this.fastify.get('/validate-id', this.handleValidateID.bind(this));
@@ -101,8 +103,8 @@ export class GtsServer {
     // OP#11 - Attribute Access
     this.fastify.get('/attr', this.handleAttribute.bind(this));
 
-    // OP#12 - Validate Schema
-    this.fastify.post('/validate-schema', this.handleValidateSchema.bind(this));
+    // OP#12 - Validate Type Schema
+    this.fastify.post('/validate-type-schema', this.handleValidateTypeSchema.bind(this));
 
     // OP#12 - Validate Entity (unified)
     this.fastify.post('/validate-entity', this.handleValidateEntity.bind(this));
@@ -160,7 +162,50 @@ export class GtsServer {
       const validate = request.query.validate === 'true' || request.query.validation === 'true';
       const entity = createJsonEntity(content);
 
+      // §9.11.1 - a malformed modifier declaration is always rejected: the
+      // document cannot be interpreted, so there is nothing to register.
+      if (entity.isSchema) {
+        const declarationError = GtsModifiers.validateDeclaration(content);
+        if (declarationError) {
+          reply.code(422);
+          return { ok: false, error: declarationError };
+        }
+      }
+
       // Strict validation for schemas when validate=true
+      if (validate && entity.isSchema) {
+        // §9.7.1 / §9.11.5 - document-level keywords must sit at the top level
+        const misplaced = GtsModifiers.findMisplacedKeywords(content);
+        if (misplaced.length > 0) {
+          reply.code(422);
+          return {
+            ok: false,
+            error: `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`,
+          };
+        }
+
+        // §9.11.2 item 1 - registration guard: cannot derive from a final base
+        const finalBase = entity.id ? this.store['store'].findFinalBaseInChain(entity.id) : null;
+        if (finalBase) {
+          reply.code(422);
+          return {
+            ok: false,
+            error: `base type '${finalBase}' is final and cannot be extended`,
+          };
+        }
+      }
+
+      // §9.11.3 item 1 - registration guard: no direct instances of an abstract type
+      if (validate && !entity.isSchema && entity.schemaId) {
+        if (this.store['store'].isAbstractType(entity.schemaId)) {
+          reply.code(422);
+          return {
+            ok: false,
+            error: `Type '${entity.schemaId}' is abstract and cannot be directly instantiated`,
+          };
+        }
+      }
+
       if (validate && entity.isSchema) {
         const validationError = this.validateSchemaStrict(content);
         if (validationError) {
@@ -377,8 +422,21 @@ export class GtsServer {
     }
   }
 
-  private async handleAddSchema(request: FastifyRequest<{ Body: any }>, reply: FastifyReply): Promise<OperationResult> {
-    return this.handleAddEntity(request as any, reply);
+  // Register a GTS Type Schema under an explicit type_id
+  private async handleAddTypeSchema(
+    request: FastifyRequest<{ Body: TypeSchemaRegisterBody }>,
+    reply: FastifyReply
+  ): Promise<OperationResult> {
+    const { type_id, type_schema } = request.body || ({} as TypeSchemaRegisterBody);
+
+    if (!type_id || !type_schema || typeof type_schema !== 'object') {
+      reply.code(422);
+      return { ok: false, error: 'Missing required fields: type_id, type_schema' };
+    }
+
+    // The explicit type_id wins over any $id carried inside the body.
+    const content = { ...type_schema, $$id: type_id };
+    return this.handleAddEntity({ ...request, body: content } as any, reply);
   }
 
   // OP#1 - Validate ID
@@ -430,15 +488,22 @@ export class GtsServer {
         is_type: seg.isType,
       })) || [];
 
-    // is_schema: true if ends with ~ and not a wildcard ending with ~*
-    const isSchema = id.endsWith('~') && !isWildcard;
+    // is_type_schema: true if ends with ~ and not a wildcard ending with ~*
+    const isTypeSchema = id.endsWith('~') && !isWildcard;
+
+    // is_type: whether the identifier names a GTS Type rather than an instance,
+    // taken from the rightmost segment (a UUID tail or a well-known instance
+    // segment makes it an instance).
+    const lastSegment = result.segments?.[result.segments.length - 1];
+    const isType = lastSegment ? lastSegment.isType : isTypeSchema;
 
     return {
       id,
       ok: result.ok,
       segments,
       error: result.error || '',
-      is_schema: isSchema,
+      is_type: isType,
+      is_type_schema: isTypeSchema,
       is_wildcard: isWildcard,
     };
   }
@@ -508,28 +573,27 @@ export class GtsServer {
     request: FastifyRequest<{ Querystring: CompatibilityParams }>,
     reply: FastifyReply
   ): Promise<any> {
-    const { old_schema_id, new_schema_id, mode = 'full' } = request.query;
+    const { old_type_id, new_type_id, mode = 'full' } = request.query;
 
-    if (!old_schema_id || !new_schema_id) {
+    if (!old_type_id || !new_type_id) {
       reply.code(400);
-      throw new Error('Missing required parameters: old_schema_id, new_schema_id');
+      throw new Error('Missing required parameters: old_type_id, new_type_id');
     }
 
-    // Call the store's checkCompatibility directly to get the correct response format
-    return this.store['store'].checkCompatibility(old_schema_id, new_schema_id, mode);
+    return this.store.checkCompatibility(old_type_id, new_type_id, mode);
   }
 
   // OP#9 - Cast
   private async handleCast(request: FastifyRequest<{ Body: CastBody }>, reply: FastifyReply): Promise<any> {
-    const { instance_id, to_schema_id } = request.body;
+    const { instance_id, to_type_id } = request.body;
 
-    if (!instance_id || !to_schema_id) {
+    if (!instance_id || !to_type_id) {
       reply.code(400);
-      throw new Error('Missing required fields: instance_id, to_schema_id');
+      throw new Error('Missing required fields: instance_id, to_type_id');
     }
 
     // Call the store's castInstance directly to get the correct response format
-    return this.store['store'].castInstance(instance_id, to_schema_id);
+    return this.store['store'].castInstance(instance_id, to_type_id);
   }
 
   // OP#10 - Query
@@ -592,16 +656,16 @@ export class GtsServer {
     return this.store['store'].getAttribute(gtsId, path);
   }
 
-  // OP#12 - Validate Schema
-  private async handleValidateSchema(
-    request: FastifyRequest<{ Body: ValidateSchemaBody }>,
+  // OP#12 - Validate Type Schema
+  private async handleValidateTypeSchema(
+    request: FastifyRequest<{ Body: ValidateTypeSchemaBody }>,
     _reply: FastifyReply
   ): Promise<any> {
-    const { schema_id } = request.body;
-    if (!schema_id) {
-      return { ok: false, error: 'Missing required field: schema_id' };
+    const { type_id } = request.body;
+    if (!type_id) {
+      return { ok: false, error: 'Missing required field: type_id' };
     }
-    return this.store['store'].validateSchemaAgainstParent(schema_id);
+    return this.store['store'].validateSchemaAgainstParent(type_id);
   }
 
   // OP#12 - Validate Entity (unified)

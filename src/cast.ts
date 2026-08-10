@@ -1,7 +1,6 @@
 import { CastResult } from './types';
 import { GtsStore } from './store';
 import { Gts } from './gts';
-import { GtsCompatibility } from './compatibility';
 
 export class GtsCast {
   static castInstance(store: GtsStore, fromId: string, toSchemaId: string): CastResult {
@@ -58,17 +57,11 @@ export class GtsCast {
         };
       }
 
-      const compatCheck = GtsCompatibility.checkCompatibility(store, fromEntity.schemaId, toSchemaId, 'full');
-
-      if (!compatCheck.is_fully_compatible) {
-        return {
-          ok: false,
-          fromId,
-          toId: toSchemaId,
-          error: `Schemas are not compatible: ${compatCheck.incompatibility_reasons.join('; ')}`,
-        };
-      }
-
+      // Casting is a separate operational contract from Type Schema Evolution
+      // Compatibility and MUST NOT be gated on it (spec §4.3, §4.6.3): a cast
+      // may legitimately rewrite values - materializing defaults, updating a
+      // `const` identity field - between definitions that are not compatible
+      // as schemas. The cast result is what has to hold up, not the verdict.
       const castedInstance = this.performCast(
         fromEntity.content,
         fromSchemaEntity.content,

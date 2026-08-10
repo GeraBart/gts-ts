@@ -104,23 +104,32 @@ program
 // OP#8 - Compatibility
 program
   .command('compatibility')
-  .description('Check schema compatibility')
-  .requiredOption('-o, --old <old>', 'Old schema ID')
-  .requiredOption('-n, --new <new>', 'New schema ID')
+  .description('Check Type Schema evolution compatibility')
+  .requiredOption('-o, --old <old>', 'Old GTS Type ID')
+  .requiredOption('-n, --new <new>', 'New GTS Type ID')
   .option('-m, --mode <mode>', 'Compatibility mode (backward|forward|full)', 'full')
   .action((options, command) => {
     const gts = loadStore(command.parent);
     const result = gts.checkCompatibility(options.old, options.new, options.mode);
     console.log(JSON.stringify(result, null, 2));
-    process.exit(result.is_fully_compatible ? 0 : 1);
+
+    // Exit status reflects the relation the caller asked about. `unknown` is an
+    // inconclusive check, not a pass, so it is non-zero too.
+    const verdict =
+      options.mode === 'backward'
+        ? result.backward_compatibility
+        : options.mode === 'forward'
+          ? result.forward_compatibility
+          : result.full_compatibility;
+    process.exit(verdict === 'compatible' ? 0 : 1);
   });
 
 // OP#9 - Cast
 program
   .command('cast')
-  .description('Cast instance to different schema version')
+  .description('Cast instance to a different type version')
   .requiredOption('-f, --from <from>', 'Source instance ID')
-  .requiredOption('-t, --to <to>', 'Target schema ID')
+  .requiredOption('-t, --to <to>', 'Target GTS Type ID')
   .action((options, command) => {
     const gts = loadStore(command.parent);
     const result = gts.castInstance(options.from, options.to);

@@ -34,7 +34,7 @@ export interface ParseResult {
   ok: boolean;
   segments: GtsIDSegment[];
   error?: string;
-  is_schema?: boolean;
+  is_type_schema?: boolean;
   is_wildcard?: boolean;
 }
 
@@ -53,10 +53,10 @@ export interface UUIDResult {
 
 export interface ExtractResult {
   id: string;
-  schema_id: string | null;
+  type_id: string | null;
   selected_entity_field?: string;
-  selected_schema_id_field?: string;
-  is_schema: boolean;
+  selected_type_id_field?: string;
+  is_type_schema: boolean;
   error?: string;
 }
 
@@ -82,11 +82,17 @@ export interface RelationshipResult {
   error?: string;
 }
 
+/** Tri-state compatibility verdict (GTS spec 0.13 §4.3). */
+export type CompatVerdict = 'compatible' | 'incompatible' | 'unknown';
+
 export interface CompatibilityResult {
-  from: string;
-  to: string;
   old: string;
   new: string;
+  backward_compatibility: CompatVerdict;
+  forward_compatibility: CompatVerdict;
+  full_compatibility: CompatVerdict;
+  from: string;
+  to: string;
   direction: string;
   added_properties: string[];
   removed_properties: string[];

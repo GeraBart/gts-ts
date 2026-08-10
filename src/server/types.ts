@@ -53,14 +53,14 @@ export interface ResolveRelationshipsParams {
 }
 
 export interface CompatibilityParams {
-  old_schema_id: string;
-  new_schema_id: string;
+  old_type_id?: string;
+  new_type_id?: string;
   mode?: 'backward' | 'forward' | 'full';
 }
 
 export interface CastBody {
   instance_id: string;
-  to_schema_id: string;
+  to_type_id: string;
 }
 
 export interface QueryParams {
@@ -73,8 +73,13 @@ export interface AttributeParams {
   path: string;
 }
 
-export interface ValidateSchemaBody {
-  schema_id: string;
+export interface ValidateTypeSchemaBody {
+  type_id: string;
+}
+
+export interface TypeSchemaRegisterBody {
+  type_id: string;
+  type_schema: Record<string, any>;
 }
 
 export interface ValidateEntityBody {

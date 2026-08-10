@@ -46,7 +46,7 @@ describe('GTS Core Operations', () => {
 
       const result = extractID(instance);
       expect(result.id).toBe('gts.vendor.pkg.ns.type.v1.0');
-      expect(result.is_schema).toBe(false);
+      expect(result.is_type_schema).toBe(false);
     });
 
     test('extracts GTS ID from schema', () => {
@@ -59,7 +59,7 @@ describe('GTS Core Operations', () => {
 
       const result = extractID(schema);
       expect(result.id).toBe('gts.vendor.pkg.ns.type.v1~');
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
 
     test('handles GTS URI prefix', () => {
@@ -71,7 +71,7 @@ describe('GTS Core Operations', () => {
 
       const result = extractID(schema);
       expect(result.id).toBe('gts.vendor.pkg.ns.type.v1~');
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
   });
 
@@ -247,7 +247,7 @@ describe('GTS Store Operations', () => {
   });
 
   describe('OP#8 - Compatibility Checking', () => {
-    test('checks backward compatibility', () => {
+    test('reports adding an optional property to an open model as forward-only', () => {
       const schemaV1 = {
         $$id: 'gts.test.pkg.ns.person.v1~',
         $$schema: 'http://json-schema.org/draft-07/schema#',
@@ -275,6 +275,38 @@ describe('GTS Store Operations', () => {
       gts.register(schemaV2);
 
       const result = gts.checkCompatibility('gts.test.pkg.ns.person.v1~', 'gts.test.pkg.ns.person.v2~', 'backward');
+
+      // Spec 0.13 §4.5: the old open schema already accepted arbitrary values
+      // under `email`, so the added property schema is not backward compatible.
+      expect(result.backward_compatibility).toBe('incompatible');
+      expect(result.forward_compatibility).toBe('compatible');
+      expect(result.full_compatibility).toBe('incompatible');
+    });
+
+    test('reports annotation-only changes as fully compatible', () => {
+      const schemaV1 = {
+        $$id: 'gts.test.pkg.ns.doc.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { name: { type: 'string', description: 'The name' } },
+        required: ['name'],
+        additionalProperties: false,
+      };
+
+      const schemaV2 = {
+        $$id: 'gts.test.pkg.ns.doc.v2~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { name: { type: 'string', description: 'A better description' } },
+        required: ['name'],
+        additionalProperties: false,
+      };
+
+      gts.register(schemaV1);
+      gts.register(schemaV2);
+
+      const result = gts.checkCompatibility('gts.test.pkg.ns.doc.v1~', 'gts.test.pkg.ns.doc.v2~');
+      expect(result.full_compatibility).toBe('compatible');
       expect(result.is_fully_compatible).toBe(true);
     });
 
@@ -445,7 +477,7 @@ describe('GTS Store Operations', () => {
         type: 'object',
       };
       const result = extractID(schema);
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
 
     test('does not detect schema without $schema field', () => {
@@ -455,7 +487,7 @@ describe('GTS Store Operations', () => {
         properties: {},
       };
       const result = extractID(notSchema);
-      expect(result.is_schema).toBe(false);
+      expect(result.is_type_schema).toBe(false);
     });
 
     test('detects schema with GTS $schema reference', () => {
@@ -465,29 +497,29 @@ describe('GTS Store Operations', () => {
         type: 'object',
       };
       const result = extractID(schema);
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
   });
 
   describe('OP#14 - Schema ID Extraction (v0.7)', () => {
-    test('extracts schema_id from chain for instances without explicit schema field', () => {
+    test('extracts type_id from chain for instances without explicit schema field', () => {
       const instance = {
         gtsId: 'gts.vendor.pkg.ns.type.v1~vendor.pkg.ns.instance.v1.0',
         data: 'test',
       };
       const result = extractID(instance);
-      // v0.7: schema_id is extracted from the chain
-      expect(result.schema_id).toBe('gts.vendor.pkg.ns.type.v1~');
+      // type_id is extracted from the chain
+      expect(result.type_id).toBe('gts.vendor.pkg.ns.type.v1~');
     });
 
-    test('extracts schema_id from chained instance ID', () => {
+    test('extracts type_id from chained instance ID', () => {
       const instance = {
         gtsId: 'gts.vendor.pkg.ns.type.v1~vendor.pkg.ns.instance.v1.0',
         $schema: 'gts.vendor.pkg.ns.type.v1~',
         data: 'test',
       };
       const result = extractID(instance);
-      expect(result.schema_id).toBe('gts.vendor.pkg.ns.type.v1~');
+      expect(result.type_id).toBe('gts.vendor.pkg.ns.type.v1~');
     });
 
     test('extracts parent type from derived schema chain', () => {
@@ -497,7 +529,7 @@ describe('GTS Store Operations', () => {
         type: 'object',
       };
       const result = extractID(schema);
-      expect(result.schema_id).toBe('gts.x.core.events.type.v1~');
+      expect(result.type_id).toBe('gts.x.core.events.type.v1~');
     });
   });
 
