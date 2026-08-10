@@ -6,6 +6,7 @@ export { GtsRelationships } from './relationships';
 export { GtsCompatibility } from './compatibility';
 export { GtsCast } from './cast';
 export { GtsQuery } from './query';
+export { GtsModifiers, DOCUMENT_LEVEL_KEYWORDS } from './modifiers';
 
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';

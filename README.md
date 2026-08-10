@@ -6,6 +6,8 @@ A complete TypeScript implementation of the Global Type System (GTS)
 
 GTS [Global Type System](https://github.com/globaltypesystem/gts-spec) is a simple, human-readable, globally unique identifier and referencing system for data type definitions (e.g., JSON Schemas) and data instances (e.g., JSON objects). This TypeScript implementation provides type-safe operations for working with GTS identifiers.
 
+**Targets gts-spec [v0.13.1](https://github.com/GlobalTypeSystem/gts-spec/releases/tag/v0.13.1)** — recorded in [`.gts-spec-version`](.gts-spec-version) and pinned by the `.gts-spec` submodule. Run `make update-spec` to check the pinned release out. See the [CHANGELOG](CHANGELOG.md) for the breaking changes in the 0.8 → 0.13 upgrade.
+
 ## Roadmap
 
 Featureset:
