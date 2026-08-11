@@ -192,6 +192,23 @@ describe('x-gts-final / x-gts-abstract enforcement through the registry', () => 
     expect(gts.validateInstance(anonId).ok).toBe(false);
   });
 
+  test('validateEntity enforces keyword placement, like registration does', () => {
+    // §9.11.5: placement is always enforced on the explicit validation
+    // endpoints, so /validate-type-schema must not accept what
+    // /entities?validate=true rejects.
+    const gts = new GTS({ validateRefs: false });
+    gts.register({
+      $$id: 'gts.x.unit.fa.place.v1~',
+      $$schema: DRAFT7,
+      type: 'object',
+      allOf: [{ type: 'object', 'x-gts-abstract': true }],
+    });
+
+    const result = gts.validateEntity('gts.x.unit.fa.place.v1~');
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/top level/);
+  });
+
   test('a malformed modifier declaration fails validation', () => {
     const gts = new GTS({ validateRefs: false });
     gts.register(base('gts.x.unit.fa.bad.v1~', { 'x-gts-final': true, 'x-gts-abstract': true }));

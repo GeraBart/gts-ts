@@ -84,6 +84,9 @@ const UNMODELED_ASSERTIONS = [
   'contains',
   'additionalItems',
   'uniqueItems',
+  // Enforced against instances by OP#6, but the engine does not model whether
+  // one reference pattern subsumes another.
+  'x-gts-ref',
 ];
 
 const MAX_DEPTH = 32;
@@ -113,8 +116,16 @@ function deepEqual(a: any, b: any): boolean {
   return aKeys.length === bKeys.length && aKeys.every((k) => k in b && deepEqual(a[k], b[k]));
 }
 
-function isGtsKeyword(key: string): boolean {
-  return key.startsWith('x-gts-');
+/**
+ * `x-gts-*` keywords describe the type rather than the instance, so they do not
+ * change Valid(S) - with one exception. `x-gts-ref` is enforced against
+ * instances during OP#6 validation, which makes it an assertion: two schemas
+ * whose reference patterns accept disjoint targets do not accept the same
+ * instances. It is therefore never stripped, and is compared as an unmodeled
+ * assertion instead.
+ */
+function isStrippableGtsKeyword(key: string): boolean {
+  return key.startsWith('x-gts-') && key !== 'x-gts-ref';
 }
 
 /** Strip annotations and GTS keywords so that documentation-only edits compare equal. */
@@ -125,7 +136,7 @@ function stripAnnotations(schema: Schema): Schema {
 
   const out: Record<string, any> = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (ANNOTATION_KEYWORDS.has(key) || isGtsKeyword(key)) continue;
+    if (ANNOTATION_KEYWORDS.has(key) || isStrippableGtsKeyword(key)) continue;
     out[key] = stripAnnotations(value);
   }
   return out;
@@ -151,7 +162,12 @@ function widenNumeric(types: Set<string>): Set<string> {
   return out;
 }
 
-function intersectTypes(a: any, b: any): any {
+/**
+ * Intersects two `type` keywords, or returns null when they are disjoint - the
+ * conjunction then accepts nothing, and the caller collapses the whole schema
+ * to `false` rather than keeping one side and pretending it is satisfiable.
+ */
+function intersectTypes(a: any, b: any): any | null {
   const setA = new Set(Array.isArray(a) ? a : [a]);
   const setB = widenNumeric(new Set(Array.isArray(b) ? b : [b]));
   const both = Array.from(widenNumeric(setA)).filter((t) => setB.has(t));
@@ -159,7 +175,7 @@ function intersectTypes(a: any, b: any): any {
   if (both.includes('integer') && both.includes('number')) {
     return 'integer';
   }
-  if (both.length === 0) return a;
+  if (both.length === 0) return null;
   return both.length === 1 ? both[0] : both;
 }
 
@@ -226,9 +242,14 @@ function mergeSchemas(a: Schema, b: Schema): Schema {
         else if (value === true) out[key] = current;
         else out[key] = mergeSchemas(current, value);
         break;
-      case 'type':
-        out[key] = intersectTypes(current, value);
+      case 'type': {
+        const intersection = intersectTypes(current, value);
+        // Disjoint types across `allOf` branches: the conjunction is the
+        // unsatisfiable schema, which accepts no instance at all.
+        if (intersection === null) return false;
+        out[key] = intersection;
         break;
+      }
       case 'enum':
         // Schemas are registered without meta-validation, so a branch may carry
         // a malformed keyword. Keep the left-hand value rather than throwing;
@@ -328,6 +349,17 @@ class SubsumptionChecker {
     this.resolver = new SchemaResolver(store);
   }
 
+  /**
+   * A reference the resolver could not follow (a local JSON pointer, or a GTS
+   * identifier that is not registered) means part of the schema was never
+   * compared. Any `compatible` reached under that condition is downgraded to
+   * `unknown` so the check fails closed rather than passing on the strength of
+   * the fragment that happened to be visible.
+   */
+  private finalize(verdict: CompatVerdict): CompatVerdict {
+    return this.resolver.hadUnresolvedRef && verdict === 'compatible' ? 'unknown' : verdict;
+  }
+
   /** Verdict for `Valid(inner) subset-of Valid(outer)`. */
   subsumes(outerRaw: Schema, innerRaw: Schema, depth = 0): CompatVerdict {
     if (depth > MAX_DEPTH) return 'unknown';
@@ -335,13 +367,13 @@ class SubsumptionChecker {
     const outer = this.resolver.resolve(outerRaw, depth);
     const inner = this.resolver.resolve(innerRaw, depth);
 
-    if (inner === false) return 'compatible'; // accepts nothing, trivially included
+    if (inner === false) return this.finalize('compatible'); // accepts nothing, trivially included
     if (outer === false) return 'incompatible';
-    if (isEmptySchema(outer)) return 'compatible'; // accepts everything
+    if (isEmptySchema(outer)) return this.finalize('compatible'); // accepts everything
 
     const outerNorm = stripAnnotations(outer);
     const innerNorm = stripAnnotations(inner);
-    if (deepEqual(outerNorm, innerNorm)) return 'compatible';
+    if (deepEqual(outerNorm, innerNorm)) return this.finalize('compatible');
 
     let verdict: CompatVerdict = 'compatible';
     verdict = worst(verdict, this.compareTypes(outerNorm, innerNorm));
@@ -351,10 +383,7 @@ class SubsumptionChecker {
     verdict = worst(verdict, this.compareArrays(outerNorm, innerNorm, depth));
     verdict = worst(verdict, this.compareUnmodeled(outerNorm, innerNorm));
 
-    if (this.resolver.hadUnresolvedRef && verdict === 'compatible') {
-      return 'unknown';
-    }
-    return verdict;
+    return this.finalize(verdict);
   }
 
   private compareTypes(outer: Schema, inner: Schema): CompatVerdict {
@@ -377,44 +406,78 @@ class SubsumptionChecker {
   }
 
   private compareBounds(outer: Schema, inner: Schema): CompatVerdict {
-    const lower: Array<[string, boolean]> = [
-      ['minimum', true],
-      ['exclusiveMinimum', true],
-      ['minLength', true],
-      ['minItems', true],
-    ];
-    const upper: Array<[string, boolean]> = [
-      ['maximum', false],
-      ['exclusiveMaximum', false],
-      ['maxLength', false],
-      ['maxItems', false],
+    const BOUND_KEYWORDS = [
+      'minimum',
+      'exclusiveMinimum',
+      'maximum',
+      'exclusiveMaximum',
+      'minLength',
+      'maxLength',
+      'minItems',
+      'maxItems',
     ];
 
     // A bound present but not numeric is a malformed schema, not a constraint
     // the engine can reason about, so the comparison is inconclusive.
     const malformed = (schema: Schema, key: string) => key in schema && typeof schema[key] !== 'number';
-
-    for (const [key] of [...lower, ...upper]) {
+    for (const key of BOUND_KEYWORDS) {
       if (malformed(outer, key) || malformed(inner, key)) return 'unknown';
     }
 
-    for (const [key] of lower) {
-      const outerBound = outer[key];
-      if (typeof outerBound !== 'number') continue;
-      const innerBound = inner[key];
-      // Outer sets a floor; inner must set one at least as high.
-      if (typeof innerBound !== 'number' || innerBound < outerBound) return 'incompatible';
-    }
+    // The inclusive and exclusive forms constrain the same axis, so they are
+    // normalized to (value, exclusive) before being compared. Without this,
+    // `minimum: 0` and `exclusiveMinimum: 0` look like unrelated keywords even
+    // though `x > 0` is a strict subset of `x >= 0`.
+    const axes: Array<{ inclusive: string; exclusive?: string; isLower: boolean }> = [
+      { inclusive: 'minimum', exclusive: 'exclusiveMinimum', isLower: true },
+      { inclusive: 'maximum', exclusive: 'exclusiveMaximum', isLower: false },
+      { inclusive: 'minLength', isLower: true },
+      { inclusive: 'maxLength', isLower: false },
+      { inclusive: 'minItems', isLower: true },
+      { inclusive: 'maxItems', isLower: false },
+    ];
 
-    for (const [key] of upper) {
-      const outerBound = outer[key];
-      if (typeof outerBound !== 'number') continue;
-      const innerBound = inner[key];
-      // Outer sets a ceiling; inner must set one no higher.
-      if (typeof innerBound !== 'number' || innerBound > outerBound) return 'incompatible';
+    for (const axis of axes) {
+      const outerBound = this.readBound(outer, axis);
+      if (outerBound === null) continue; // outer constrains nothing on this axis
+      const innerBound = this.readBound(inner, axis);
+      if (innerBound === null) return 'incompatible'; // inner is unbounded where outer is not
+
+      if (!this.isAtLeastAsStrict(innerBound, outerBound, axis.isLower)) return 'incompatible';
     }
 
     return 'compatible';
+  }
+
+  /** The effective bound on one axis as `(value, exclusive)`, or null when unconstrained. */
+  private readBound(
+    schema: Schema,
+    axis: { inclusive: string; exclusive?: string; isLower: boolean }
+  ): { value: number; exclusive: boolean } | null {
+    const inclusive = schema[axis.inclusive];
+    const exclusive = axis.exclusive ? schema[axis.exclusive] : undefined;
+
+    const candidates: Array<{ value: number; exclusive: boolean }> = [];
+    if (typeof inclusive === 'number') candidates.push({ value: inclusive, exclusive: false });
+    if (typeof exclusive === 'number') candidates.push({ value: exclusive, exclusive: true });
+    if (candidates.length === 0) return null;
+
+    // Both forms present: the tighter one wins, matching `allOf` conjunction.
+    return candidates.reduce((strictest, candidate) =>
+      this.isAtLeastAsStrict(candidate, strictest, axis.isLower) ? candidate : strictest
+    );
+  }
+
+  private isAtLeastAsStrict(
+    candidate: { value: number; exclusive: boolean },
+    reference: { value: number; exclusive: boolean },
+    isLower: boolean
+  ): boolean {
+    if (candidate.value === reference.value) {
+      // At the same value, excluding the endpoint is the stricter constraint.
+      return candidate.exclusive || !reference.exclusive;
+    }
+    return isLower ? candidate.value > reference.value : candidate.value < reference.value;
   }
 
   private compareObjects(outer: Schema, inner: Schema, depth: number): CompatVerdict {

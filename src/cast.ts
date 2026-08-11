@@ -69,6 +69,19 @@ export class GtsCast {
         toSchemaId
       );
 
+      // The cast is judged by its result, not by a compatibility verdict: it
+      // succeeds only when the transformed instance satisfies the target type.
+      const validationError = store.validateCastResult(toSchema.content, castedInstance);
+      if (validationError) {
+        return {
+          ok: false,
+          fromId,
+          toId: toSchemaId,
+          result: castedInstance,
+          error: `Cast result does not satisfy ${toSchemaId}: ${validationError}`,
+        };
+      }
+
       return {
         ok: true,
         fromId,

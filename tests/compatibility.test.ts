@@ -337,6 +337,151 @@ describe('OP#8 - malformed schemas degrade instead of throwing', () => {
   });
 });
 
+describe('OP#8 - assertions that are not annotations', () => {
+  test('a differing x-gts-ref pattern is not treated as documentation', () => {
+    // x-gts-ref is enforced against instances by OP#6, so two schemas whose
+    // reference patterns accept disjoint targets do not accept the same
+    // instances - the engine must not strip it along with the other x-gts-*.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.xref.evt.v1.0~';
+    const newId = 'gts.x.unit.xref.evt.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { ref: { type: 'string', 'x-gts-ref': 'gts.x.unit.alpha.*' } },
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { ref: { type: 'string', 'x-gts-ref': 'gts.x.unit.beta.*' } },
+    });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+
+  test('an identical x-gts-ref still compares as compatible', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.xrefsame.evt.v1.0~';
+    const newId = 'gts.x.unit.xrefsame.evt.v1.1~';
+    const body = {
+      type: 'object',
+      properties: { ref: { type: 'string', 'x-gts-ref': 'gts.x.unit.alpha.*' } },
+      additionalProperties: false,
+    };
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, ...body });
+    gts.register({ $$id: newId, $$schema: DRAFT7, ...body });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('compatible');
+  });
+});
+
+describe('OP#8 - unresolvable references fail closed', () => {
+  test('a local JSON pointer the engine cannot follow reports unknown', () => {
+    // Both documents look identical once `$ref` is dropped and `definitions`
+    // is stripped, but the pointed-at subschemas differ.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.localref.t.v1.0~';
+    const newId = 'gts.x.unit.localref.t.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      definitions: { T: { type: 'string' } },
+      $$ref: '#/definitions/T',
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      definitions: { T: { type: 'number' } },
+      $$ref: '#/definitions/T',
+    });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+
+  test('a $ref to an unregistered GTS type reports unknown', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.deadref.t.v1.0~';
+    const newId = 'gts.x.unit.deadref.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'object', properties: { a: { type: 'string' } } });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { a: { type: 'string' } },
+      allOf: [{ $$ref: 'gts://gts.x.unit.deadref.absent.v1~' }],
+    });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+});
+
+describe('OP#8 - contradictory allOf branches are unsatisfiable', () => {
+  test('disjoint types across allOf collapse to a schema accepting nothing', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.disjoint.t.v1.0~';
+    const newId = 'gts.x.unit.disjoint.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, allOf: [{ type: 'string' }, { type: 'number' }] });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'string' });
+
+    const result = gts.checkCompatibility(oldId, newId);
+    // Valid(old) is empty, so it is included in Valid(new) but not vice versa.
+    expect(result.backward_compatibility).toBe('compatible');
+    expect(result.forward_compatibility).toBe('incompatible');
+    expect(result.full_compatibility).toBe('incompatible');
+  });
+});
+
+describe('OP#8 - inclusive and exclusive bounds are the same axis', () => {
+  const register = (gts: GTS, id: string, bound: Record<string, number>) =>
+    gts.register({
+      $$id: id,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { n: { type: 'number', ...bound } },
+      additionalProperties: false,
+    });
+
+  test('tightening minimum:0 to exclusiveMinimum:0 is forward compatible only', () => {
+    const gts = new GTS({ validateRefs: false });
+    register(gts, 'gts.x.unit.bounds.excl.v1.0~', { minimum: 0 });
+    register(gts, 'gts.x.unit.bounds.excl.v1.1~', { exclusiveMinimum: 0 });
+
+    const result = gts.checkCompatibility('gts.x.unit.bounds.excl.v1.0~', 'gts.x.unit.bounds.excl.v1.1~');
+    // `x > 0` is a strict subset of `x >= 0`.
+    expect(result.forward_compatibility).toBe('compatible');
+    expect(result.backward_compatibility).toBe('incompatible');
+  });
+
+  test('relaxing exclusiveMaximum:10 to maximum:10 is backward compatible only', () => {
+    const gts = new GTS({ validateRefs: false });
+    register(gts, 'gts.x.unit.bounds.incl.v1.0~', { exclusiveMaximum: 10 });
+    register(gts, 'gts.x.unit.bounds.incl.v1.1~', { maximum: 10 });
+
+    const result = gts.checkCompatibility('gts.x.unit.bounds.incl.v1.0~', 'gts.x.unit.bounds.incl.v1.1~');
+    expect(result.backward_compatibility).toBe('compatible');
+    expect(result.forward_compatibility).toBe('incompatible');
+  });
+
+  test('the same bound expressed identically stays fully compatible', () => {
+    const gts = new GTS({ validateRefs: false });
+    register(gts, 'gts.x.unit.bounds.same.v1.0~', { exclusiveMinimum: 5 });
+    register(gts, 'gts.x.unit.bounds.same.v1.1~', { exclusiveMinimum: 5 });
+
+    expect(
+      gts.checkCompatibility('gts.x.unit.bounds.same.v1.0~', 'gts.x.unit.bounds.same.v1.1~').full_compatibility
+    ).toBe('compatible');
+  });
+});
+
 describe('OP#8 - identifiers and reference resolution', () => {
   test('accepts gts:// URI form for either identifier', () => {
     const gts = new GTS({ validateRefs: false });

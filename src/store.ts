@@ -785,6 +785,24 @@ export class GtsStore {
     return schema;
   }
 
+  /**
+   * Validates a cast result against the target type schema, ignoring the
+   * identity `const`s that a cast legitimately rewrites (§4.6.3). Returns an
+   * error message, or null when the result satisfies the target type.
+   */
+  validateCastResult(toSchema: any, casted: any): string | null {
+    try {
+      const modifiedSchema = this.removeGtsConstConstraints(toSchema);
+      const validate = this.ajv.compile(this.normalizeSchema(modifiedSchema));
+      if (validate(casted)) {
+        return null;
+      }
+      return validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Validation failed';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   private removeGtsConstConstraints(schema: any): any {
     if (schema === null || schema === undefined) {
       return schema;
@@ -860,6 +878,18 @@ export class GtsStore {
     const declarationError = GtsModifiers.validateDeclaration(content);
     if (declarationError) {
       return { id: schemaId, ok: false, error: declarationError };
+    }
+
+    // §9.7.1 / §9.11.5 - placement is "always enforced on explicit validation
+    // endpoints", so it is checked here as well as at registration; otherwise
+    // /validate-type-schema would accept what /entities?validate=true rejects.
+    const misplaced = GtsModifiers.findMisplacedKeywords(content);
+    if (misplaced.length > 0) {
+      return {
+        id: schemaId,
+        ok: false,
+        error: `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`,
+      };
     }
 
     // §9.11.2 item 2 - a final type anywhere in the base chain blocks derivation

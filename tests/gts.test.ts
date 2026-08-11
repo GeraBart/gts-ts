@@ -382,6 +382,50 @@ describe('GTS Store Operations', () => {
     });
   });
 
+  describe('OP#9 - a cast succeeds only if its result fits the target', () => {
+    beforeEach(() => {
+      gts.register({
+        $$id: 'gts.test.pkg.ns.shape.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a'],
+        properties: { a: { type: 'string' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.shape.v2~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a'],
+        properties: { a: { type: 'number' } },
+      });
+    });
+
+    test('fails when the casted value does not satisfy the target type', () => {
+      gts.register({
+        id: 'gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1',
+        $schema: 'gts.test.pkg.ns.shape.v1~',
+        a: 'not-a-number',
+      });
+
+      const result = gts.castInstance('gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1', 'gts.test.pkg.ns.shape.v2~');
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/does not satisfy/);
+    });
+
+    test('succeeds when the casted value does satisfy the target type', () => {
+      gts.register({
+        id: 'gts.test.pkg.ns.shape.v1~test.pkg._.good.v1',
+        $schema: 'gts.test.pkg.ns.shape.v1~',
+        a: 42,
+      });
+
+      const result = gts.castInstance('gts.test.pkg.ns.shape.v1~test.pkg._.good.v1', 'gts.test.pkg.ns.shape.v2~');
+
+      expect(result.ok).toBe(true);
+    });
+  });
+
   describe('OP#9 - cast responses name the target consistently', () => {
     test('a failed cast still reports to_type_id', () => {
       const store = new GtsStore({ validateRefs: false });
