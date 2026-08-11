@@ -468,7 +468,7 @@ export class GtsStore {
       if (!instanceEntity) {
         return {
           instance_id: instanceId,
-          to_schema_id: toSchemaId,
+          to_type_id: toSchemaId,
           ok: false,
           error: `Entity not found: ${instanceId}`,
         };
@@ -479,7 +479,7 @@ export class GtsStore {
       if (!toSchema) {
         return {
           instance_id: instanceId,
-          to_schema_id: toSchemaId,
+          to_type_id: toSchemaId,
           ok: false,
           error: `Schema not found: ${toSchemaId}`,
         };
@@ -492,7 +492,7 @@ export class GtsStore {
         // Not allowed to cast directly from a schema
         return {
           instance_id: instanceId,
-          to_schema_id: toSchemaId,
+          to_type_id: toSchemaId,
           ok: false,
           error: 'Source must be an instance, not a schema',
         };
@@ -502,7 +502,7 @@ export class GtsStore {
         if (!fromSchemaId) {
           return {
             instance_id: instanceId,
-            to_schema_id: toSchemaId,
+            to_type_id: toSchemaId,
             ok: false,
             error: `Schema not found for instance: ${instanceId}`,
           };
@@ -511,7 +511,7 @@ export class GtsStore {
         if (fromSchemaId.startsWith('http://') || fromSchemaId.startsWith('https://')) {
           return {
             instance_id: instanceId,
-            to_schema_id: toSchemaId,
+            to_type_id: toSchemaId,
             ok: false,
             error: `Cannot cast instance with schema ${fromSchemaId}`,
           };
@@ -520,7 +520,7 @@ export class GtsStore {
         if (!fromSchema) {
           return {
             instance_id: instanceId,
-            to_schema_id: toSchemaId,
+            to_type_id: toSchemaId,
             ok: false,
             error: `Schema not found: ${fromSchemaId}`,
           };
@@ -537,7 +537,7 @@ export class GtsStore {
     } catch (error) {
       return {
         instance_id: instanceId,
-        to_schema_id: toSchemaId,
+        to_type_id: toSchemaId,
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       };
@@ -904,7 +904,7 @@ export class GtsStore {
     const overlay = this.extractOverlay(content);
 
     // Compare overlay against resolved parent
-    const inheritsViaRef = this.findParentRef(content) !== null;
+    const inheritsViaRef = this.inheritsParentViaRef(content, parentId);
     const errors = this.compareOverlayToBase(overlay, resolvedParent, '', inheritsViaRef);
     if (errors.length > 0) {
       return { id: schemaId, ok: false, error: errors.join('; ') };
@@ -1000,18 +1000,22 @@ export class GtsStore {
       return { id: schemaId, ok: false, error: `effective trait schema cannot be satisfied: ${unsatisfiable}` };
     }
 
-    // Abstract types are exempt from completeness: descendants close the gaps.
-    const self = this.get(schemaId);
-    if (self && GtsModifiers.isAbstract(self.content)) {
-      return { id: schemaId, ok: true, error: '' };
-    }
-
+    // `x-gts-traits-schema: false` bans traits across the whole subtree, which
+    // is a prohibition rather than a completeness requirement - so it applies
+    // to abstract members of that subtree too, and is checked before the
+    // abstract exemption below.
     if (traitsProhibited && Object.keys(materialized).length > 0) {
       return {
         id: schemaId,
         ok: false,
         error: 'x-gts-traits-schema is false in the inheritance chain, so no traits are permitted',
       };
+    }
+
+    // Abstract types are exempt from completeness: descendants close the gaps.
+    const self = this.get(schemaId);
+    if (self && GtsModifiers.isAbstract(self.content)) {
+      return { id: schemaId, ok: true, error: '' };
     }
 
     if (traitSchemas.length === 0) {
@@ -1296,19 +1300,36 @@ export class GtsStore {
     return null;
   }
 
-  private findParentRef(schema: any): string | null {
-    if (!schema || !schema.allOf || !Array.isArray(schema.allOf)) {
-      return null;
+  /** Every `$ref` / `$$ref` declared directly by an `allOf` branch of `schema`. */
+  private collectAllOfRefs(schema: any): string[] {
+    if (!schema || !Array.isArray(schema.allOf)) {
+      return [];
     }
+    const refs: string[] = [];
     for (const sub of schema.allOf) {
       if (sub && typeof sub === 'object') {
         const ref = sub['$$ref'] || sub['$ref'];
         if (typeof ref === 'string') {
-          return ref;
+          refs.push(ref);
         }
       }
     }
-    return null;
+    return refs;
+  }
+
+  /**
+   * True when the derived body pulls its chain parent in through `allOf` +
+   * `$ref`, so the parent's constraints keep applying to the same instance.
+   *
+   * A reference to some unrelated type does not count: the parent's
+   * constraints would not be inherited, so the derived body still has to
+   * restate them (ADR-0001 variant 2c).
+   */
+  private inheritsParentViaRef(schema: any, parentId: string): boolean {
+    return this.collectAllOfRefs(schema).some((ref) => {
+      const normalized = ref.startsWith(GTS_URI_PREFIX) ? ref.substring(GTS_URI_PREFIX.length) : ref;
+      return normalized === parentId;
+    });
   }
 
   private resolveSchemaFully(schema: any, visited: Set<string> = new Set()): ResolvedSchema {

@@ -520,26 +520,21 @@ export class Gts {
   }
 
   /**
-   * Reads the version token out of a wildcard pattern segment such as
+   * Reads the major version out of a wildcard pattern segment such as
    * `x.pkg.ns.type.v0.*`. The parsed segment cannot express this: an omitted
    * major version and `v0` both leave `verMajor` at 0.
+   *
+   * Only the major version can appear before the wildcard. A minor-qualified
+   * form (`type.v1.2.*`) would be a seven-token segment, which the parser
+   * rejects; the way to select one minor version and its derived types is the
+   * chain-suffix wildcard `type.v1.2~*`.
    */
-  private static wildcardPatternVersion(segment: string): {
-    majorSpecified: boolean;
-    major: number;
-    minorSpecified: boolean;
-    minor: number;
-  } {
-    const match = /(?:^|\.)v(\d+)(?:\.(\d+))?\.\*$/.exec(segment);
+  private static wildcardPatternVersion(segment: string): { majorSpecified: boolean; major: number } {
+    const match = /(?:^|\.)v(\d+)\.\*$/.exec(segment);
     if (!match) {
-      return { majorSpecified: false, major: 0, minorSpecified: false, minor: 0 };
+      return { majorSpecified: false, major: 0 };
     }
-    return {
-      majorSpecified: true,
-      major: parseInt(match[1], 10),
-      minorSpecified: match[2] !== undefined,
-      minor: match[2] !== undefined ? parseInt(match[2], 10) : 0,
-    };
+    return { majorSpecified: true, major: parseInt(match[1], 10) };
   }
 
   private static matchSegments(
@@ -583,12 +578,10 @@ export class Gts {
         if (pSeg.type && pSeg.type !== cSeg.type) {
           return false;
         }
-        // Check version fields only when the pattern actually spells one out
+        // Check the version only when the pattern actually spells one out.
+        // A major-only wildcard matches any minor of that major.
         const patternVersion = this.wildcardPatternVersion(pSeg.segment);
         if (patternVersion.majorSpecified && patternVersion.major !== cSeg.verMajor) {
-          return false;
-        }
-        if (patternVersion.minorSpecified && (cSeg.verMinor === undefined || patternVersion.minor !== cSeg.verMinor)) {
           return false;
         }
         // Check is_type flag if set

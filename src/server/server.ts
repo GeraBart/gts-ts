@@ -20,6 +20,20 @@ import {
 } from './types';
 import * as gts from '../index';
 
+/**
+ * Version reported by the generated OpenAPI document. Read from `package.json`
+ * so it cannot drift from the published version; the file sits two levels above
+ * both `src/server` (ts-node) and `dist/server` (compiled output).
+ */
+const PACKAGE_VERSION: string = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('../../package.json').version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 export class GtsServer {
   private fastify: FastifyInstance;
   private store: GTS;
@@ -398,6 +412,15 @@ export class GtsServer {
       for (const content of entities) {
         try {
           const entity = createJsonEntity(content);
+
+          // A malformed modifier declaration is rejected on every registration
+          // path, so the bulk endpoint applies the same check as POST /entities.
+          const declarationError = entity.isSchema ? GtsModifiers.validateDeclaration(content) : null;
+          if (declarationError) {
+            errors.push(declarationError);
+            continue;
+          }
+
           if (entity.id) {
             this.store.register(content);
             registered.push(entity.id);
@@ -434,8 +457,13 @@ export class GtsServer {
       return { ok: false, error: 'Missing required fields: type_id, type_schema' };
     }
 
-    // The explicit type_id wins over any $id carried inside the body.
-    const content = { ...type_schema, $$id: type_id };
+    // The explicit type_id wins over any identifier carried inside the body, so
+    // an embedded $id must be dropped rather than left to shadow it.
+    const content: Record<string, any> = { ...type_schema };
+    delete content['$id'];
+    delete content['$$id'];
+    content['$$id'] = type_id;
+
     return this.handleAddEntity({ ...request, body: content } as any, reply);
   }
 
@@ -687,7 +715,7 @@ export class GtsServer {
       openapi: '3.0.0',
       info: {
         title: 'GTS Server',
-        version: '0.1.0',
+        version: PACKAGE_VERSION,
         description: 'GTS (Global Type System) HTTP API',
       },
       servers: [

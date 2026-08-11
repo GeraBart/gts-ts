@@ -94,8 +94,15 @@ export interface CompatibilityResult {
   from: string;
   to: string;
   direction: string;
+  /**
+   * @deprecated Always empty since 0.4.0. Compatibility is decided by comparing
+   * accepted-instance sets (§4.3) rather than by diffing properties, so the
+   * engine no longer produces a property diff. Slated for removal.
+   */
   added_properties: string[];
+  /** @deprecated Always empty since 0.4.0. See {@link CompatibilityResult.added_properties}. */
   removed_properties: string[];
+  /** @deprecated Always empty since 0.4.0. See {@link CompatibilityResult.added_properties}. */
   changed_properties: Array<Record<string, string>>;
   is_fully_compatible: boolean;
   is_backward_compatible: boolean;

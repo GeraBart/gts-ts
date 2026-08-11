@@ -255,6 +255,19 @@ describe('OP#13 - boolean trait schemas (ADR-0002)', () => {
     expect(gts.validateEntity(kidId).ok).toBe(false);
   });
 
+  test('`false` rejects traits on an abstract descendant too', () => {
+    // Prohibition bans traits across the whole subtree; it is not a
+    // completeness rule, so the abstract exemption must not bypass it.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.falseabs.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(baseType(baseId, { 'x-gts-traits-schema': false }));
+    gts.register(derivedType(kidId, baseId, { 'x-gts-abstract': true, 'x-gts-traits': { retention: 'P30D' } }));
+
+    expect(gts.validateEntity(kidId).ok).toBe(false);
+  });
+
   test('`true` permits arbitrary traits', () => {
     const gts = new GTS({ validateRefs: false });
     const baseId = 'gts.x.unit.tr.true.v1~';

@@ -82,6 +82,19 @@ describe('GTS Type Schema Modifiers (spec §9.11)', () => {
       expect(found).toHaveLength(2);
     });
 
+    test('fails closed when a document is nested too deeply to scan', () => {
+      // The recursion guard must not let a subtree through unchecked: a
+      // keyword hidden below the limit would otherwise be silently accepted.
+      let deep: Record<string, any> = { 'x-gts-final': true };
+      for (let i = 0; i < 80; i++) {
+        deep = { properties: { nested: deep } };
+      }
+
+      const found = GtsModifiers.findMisplacedKeywords({ type: 'object', ...deep });
+      expect(found.length).toBeGreaterThan(0);
+      expect(found[0]).toMatch(/nesting exceeds/);
+    });
+
     test('does not descend into the values of the top-level keywords', () => {
       // A trait *value* that happens to be keyed like a keyword is ordinary
       // data, and a trait-schema body may legitimately carry x-gts-* members.

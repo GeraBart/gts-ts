@@ -1,4 +1,14 @@
-import { GTS, isValidGtsID, validateGtsID, parseGtsID, matchIDPattern, idToUUID, extractID } from '../src';
+import {
+  GTS,
+  GtsStore,
+  createJsonEntity,
+  isValidGtsID,
+  validateGtsID,
+  parseGtsID,
+  matchIDPattern,
+  idToUUID,
+  extractID,
+} from '../src';
 
 describe('GTS Core Operations', () => {
   describe('OP#1 - ID Validation', () => {
@@ -337,6 +347,62 @@ describe('GTS Store Operations', () => {
       const result = gts.checkCompatibility('gts.test.pkg.ns.person.v1~', 'gts.test.pkg.ns.person.v2~', 'backward');
       expect(result.is_fully_compatible).toBe(false);
       expect(result.incompatibility_reasons.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('OP#12 - derivation form', () => {
+    test('an allOf $ref to an unrelated type does not stand in for the chain parent', () => {
+      // Only a reference to the chain parent inherits its constraints. Without
+      // one, the derived schema has to restate them (ADR-0001 variant 2c), so
+      // dropping a required field and opening a closed base must fail.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.strict.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a', 'b'],
+        properties: { a: { type: 'string' }, b: { type: 'string' } },
+        additionalProperties: false,
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.unrelated.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.strict.v1~test.pkg._.lax.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a'],
+        properties: { a: { type: 'string' } },
+        additionalProperties: true,
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.unrelated.v1~' }],
+      });
+
+      expect(gts.validateEntity('gts.test.pkg.ns.strict.v1~test.pkg._.lax.v1~').ok).toBe(false);
+    });
+  });
+
+  describe('OP#9 - cast responses name the target consistently', () => {
+    test('a failed cast still reports to_type_id', () => {
+      const store = new GtsStore({ validateRefs: false });
+      store.register(
+        createJsonEntity({
+          $$id: 'gts.test.pkg.ns.castsrc.v1~',
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      );
+      store.register(createJsonEntity({ id: 'gts.test.pkg.ns.castsrc.v1~test.pkg._.item.v1' }));
+
+      // The target type is not registered, so this takes a failure path.
+      const result: Record<string, any> = store.castInstance(
+        'gts.test.pkg.ns.castsrc.v1~test.pkg._.item.v1',
+        'gts.test.pkg.ns.missing.v2~'
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.to_type_id).toBe('gts.test.pkg.ns.missing.v2~');
+      expect(result).not.toHaveProperty('to_schema_id');
     });
   });
 

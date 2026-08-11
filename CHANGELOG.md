@@ -51,6 +51,11 @@ The previous boolean fields (`is_backward_compatible`, `is_forward_compatible`,
   `GtsCompatibility.checkCompatibility(store, old, new)`.
 - `GtsStore.validateEntityTraits()` was removed. `/validate-entity` and `/validate-type-schema`
   now apply the same type-level checks, so it no longer had separate semantics.
+- `CompatibilityResult.added_properties`, `removed_properties` and `changed_properties` are
+  now **always empty** and are deprecated. The engine decides compatibility by comparing
+  accepted-instance sets rather than by diffing properties, so it no longer produces a
+  property diff. The fields remain on the type and in the `GET /compatibility` response so
+  existing consumers keep parsing, but they carry no information and will be removed.
 - `GtsCast.castInstance()` no longer refuses when the two type schemas are not fully
   compatible. Casting is a separate operational contract that the spec requires to be
   reported separately from schema compatibility (§4.3, §4.6.3); under 0.13 almost no real

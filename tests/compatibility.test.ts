@@ -271,7 +271,69 @@ describe('OP#8 - inconclusive checks report `unknown`', () => {
     expect(result.backward_compatibility).toBe('unknown');
     expect(result.forward_compatibility).toBe('unknown');
     expect(result.full_compatibility).toBe('unknown');
-    expect(result.incompatibility_reasons.length).toBeGreaterThan(0);
+    // One reason per missing side, each reported once.
+    expect(result.incompatibility_reasons).toEqual([
+      'Old type schema not found: gts.x.unit.unknown.missing.v1.0~',
+      'New type schema not found: gts.x.unit.unknown.missing.v1.1~',
+    ]);
+  });
+
+  test('a bound that is present but not numeric is unknown', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.unknown.bound.v1.0~';
+    const newId = 'gts.x.unit.unknown.bound.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { a: { type: 'string', maxLength: 10 } },
+      additionalProperties: false,
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { a: { type: 'string', maxLength: 'ten' } },
+      additionalProperties: false,
+    });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+});
+
+describe('OP#8 - malformed schemas degrade instead of throwing', () => {
+  // Schemas are registered without JSON Schema meta-validation, so the engine
+  // has to survive keywords of the wrong shape.
+  test('a non-array enum reached through allOf does not crash the check', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.malformed.enum.v1.0~';
+    const newId = 'gts.x.unit.malformed.enum.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      allOf: [{ properties: { a: { enum: ['x'] } } }, { properties: { a: { enum: 'not-an-array' } } }],
+    });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'object', properties: { a: { enum: ['x', 'y'] } } });
+
+    expect(() => gts.checkCompatibility(oldId, newId)).not.toThrow();
+  });
+
+  test('a schema that cannot be compared at all reports unknown', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.malformed.cyclic.v1.0~';
+    const newId = 'gts.x.unit.malformed.cyclic.v1.1~';
+
+    const cyclic: any = { $$id: oldId, $$schema: DRAFT7, type: 'object', properties: {} };
+    cyclic.properties.self = cyclic; // a structure JSON could never carry
+
+    gts.register(cyclic);
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'object', properties: { self: { type: 'string' } } });
+
+    const result = gts.checkCompatibility(oldId, newId);
+    expect(['unknown', 'incompatible']).toContain(result.full_compatibility);
   });
 });
 

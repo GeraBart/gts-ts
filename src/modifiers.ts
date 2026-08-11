@@ -83,7 +83,15 @@ export class GtsModifiers {
   }
 
   private static scan(node: any, path: string, found: string[], depth: number): void {
-    if (depth > MAX_DEPTH || !node || typeof node !== 'object') return;
+    if (!node || typeof node !== 'object') return;
+
+    // The guard bounds recursion on pathological input. Stopping silently would
+    // let a misplaced keyword below the limit through, so it fails closed: the
+    // unscanned subtree is itself reported and the document is rejected.
+    if (depth > MAX_DEPTH) {
+      found.push(`${path} (nesting exceeds ${MAX_DEPTH} levels; cannot verify keyword placement)`);
+      return;
+    }
 
     if (Array.isArray(node)) {
       node.forEach((item, index) => this.scan(item, `${path}[${index}]`, found, depth + 1));

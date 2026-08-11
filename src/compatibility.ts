@@ -230,7 +230,12 @@ function mergeSchemas(a: Schema, b: Schema): Schema {
         out[key] = intersectTypes(current, value);
         break;
       case 'enum':
-        out[key] = (current as any[]).filter((x) => (value as any[]).some((y) => deepEqual(x, y)));
+        // Schemas are registered without meta-validation, so a branch may carry
+        // a malformed keyword. Keep the left-hand value rather than throwing;
+        // the divergence then surfaces through the normal comparison.
+        if (Array.isArray(current) && Array.isArray(value)) {
+          out[key] = current.filter((x) => value.some((y) => deepEqual(x, y)));
+        }
         break;
       case 'items':
         out[key] = mergeSchemas(current, value);
@@ -239,13 +244,17 @@ function mergeSchemas(a: Schema, b: Schema): Schema {
       case 'exclusiveMinimum':
       case 'minLength':
       case 'minItems':
-        out[key] = Math.max(current as number, value as number);
+        if (typeof current === 'number' && typeof value === 'number') {
+          out[key] = Math.max(current, value);
+        }
         break;
       case 'maximum':
       case 'exclusiveMaximum':
       case 'maxLength':
       case 'maxItems':
-        out[key] = Math.min(current as number, value as number);
+        if (typeof current === 'number' && typeof value === 'number') {
+          out[key] = Math.min(current, value);
+        }
         break;
       default:
         // Keep the left-hand value; unmodeled divergence surfaces as `unknown`.
@@ -380,6 +389,14 @@ class SubsumptionChecker {
       ['maxLength', false],
       ['maxItems', false],
     ];
+
+    // A bound present but not numeric is a malformed schema, not a constraint
+    // the engine can reason about, so the comparison is inconclusive.
+    const malformed = (schema: Schema, key: string) => key in schema && typeof schema[key] !== 'number';
+
+    for (const [key] of [...lower, ...upper]) {
+      if (malformed(outer, key) || malformed(inner, key)) return 'unknown';
+    }
 
     for (const [key] of lower) {
       const outerBound = outer[key];
@@ -525,17 +542,25 @@ export class GtsCompatibility {
     const oldSchema = oldEntity!.content;
     const newSchema = newEntity!.content;
 
-    // backward: Valid(old) subset-of Valid(new); forward: Valid(new) subset-of Valid(old).
-    const { backward, forward } = this.compareSchemas(store, oldSchema, newSchema);
+    try {
+      // backward: Valid(old) subset-of Valid(new); forward: Valid(new) subset-of Valid(old).
+      const { backward, forward } = this.compareSchemas(store, oldSchema, newSchema);
 
-    return this.buildResult(
-      normalizedOld,
-      normalizedNew,
-      backward,
-      forward,
-      backward === 'compatible' ? [] : [`Backward compatibility is ${backward}`],
-      forward === 'compatible' ? [] : [`Forward compatibility is ${forward}`]
-    );
+      return this.buildResult(
+        normalizedOld,
+        normalizedNew,
+        backward,
+        forward,
+        backward === 'compatible' ? [] : [`Backward compatibility is ${backward}`],
+        forward === 'compatible' ? [] : [`Forward compatibility is ${forward}`]
+      );
+    } catch (error) {
+      // Schemas are registered without meta-validation, so a malformed document
+      // can reach the engine. That makes the check inconclusive - it must not
+      // take the caller down with it.
+      const reason = `Compatibility check failed: ${error instanceof Error ? error.message : String(error)}`;
+      return this.buildResult(normalizedOld, normalizedNew, 'unknown', 'unknown', [reason], []);
+    }
   }
 
   private static normalizeId(id: string): string {
@@ -574,7 +599,8 @@ export class GtsCompatibility {
       is_fully_compatible: full === 'compatible',
       is_backward_compatible: backward === 'compatible',
       is_forward_compatible: forward === 'compatible',
-      incompatibility_reasons: [...backwardErrors, ...forwardErrors],
+      // A reason that applies to both directions is reported once.
+      incompatibility_reasons: Array.from(new Set([...backwardErrors, ...forwardErrors])),
       backward_errors: backwardErrors,
       forward_errors: forwardErrors,
     };
