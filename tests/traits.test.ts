@@ -338,6 +338,77 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     expect(result.error).toMatch(/cannot be satisfied/);
   });
 
+  test('sibling allOf branches may reference the same trait schema', () => {
+    // Cycle detection tracks the active recursion path; two siblings pointing
+    // at one common trait schema is reuse, not recursion.
+    const gts = new GTS({ validateRefs: false });
+    const commonId = 'gts.x.unit.tr.common.v1~';
+    const baseId = 'gts.x.unit.tr.siblings.v1~';
+
+    gts.register(baseType(commonId, { type: 'object', properties: { k: { type: 'string' } } }));
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { allOf: [{ $$ref: `gts://${commonId}` }, { $$ref: `gts://${commonId}` }] },
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(true);
+  });
+
+  test('a genuinely recursive trait schema is still rejected', () => {
+    const gts = new GTS({ validateRefs: false });
+    const selfId = 'gts.x.unit.tr.selfref.v1~';
+
+    gts.register(baseType(selfId, { 'x-gts-traits-schema': { $$ref: `gts://${selfId}` } }));
+
+    expect(gts.validateEntity(selfId).ok).toBe(false);
+  });
+
+  test('abstract types are not exempt from an impossible const across the chain', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.constclash.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { k: { const: 'a' } } },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { k: { const: 'b' } } },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/no value satisfies/);
+  });
+
+  test('abstract types are not exempt from crossed bounds across the chain', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.boundclash.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { n: { type: 'integer', minimum: 10 } } },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { n: { type: 'integer', maximum: 5 } } },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(false);
+  });
+
   test('a closed descendant trait-schema must not orphan an ancestor trait', () => {
     const gts = new GTS({ validateRefs: false });
     const baseId = 'gts.x.unit.tr.orphan.v1~';

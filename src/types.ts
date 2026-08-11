@@ -2,6 +2,16 @@ export const GTS_PREFIX = 'gts.';
 export const GTS_URI_PREFIX = 'gts://';
 export const MAX_ID_LENGTH = 1024;
 
+/**
+ * Recursion bound shared by every walker over schema documents.
+ *
+ * The limit exists to stop pathological or cyclic input, never to decide a
+ * result. Whatever hits it must fail closed - report the finding, or mark the
+ * comparison inconclusive - and must never return a value that reads as
+ * "unconstrained", which would turn a bailout into a silent pass.
+ */
+export const MAX_SCHEMA_DEPTH = 64;
+
 export interface GtsIDSegment {
   num: number;
   offset: number;

@@ -401,24 +401,16 @@ describe('GTS Store Operations', () => {
     });
 
     test('fails when the casted value does not satisfy the target type', () => {
-      gts.register({
-        id: 'gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1',
-        $schema: 'gts.test.pkg.ns.shape.v1~',
-        a: 'not-a-number',
-      });
+      gts.register({ id: 'gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1', a: 'not-a-number' });
 
       const result = gts.castInstance('gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1', 'gts.test.pkg.ns.shape.v2~');
 
       expect(result.ok).toBe(false);
-      expect(result.error).toMatch(/does not satisfy/);
+      expect(result.error).toMatch(/must be number/);
     });
 
     test('succeeds when the casted value does satisfy the target type', () => {
-      gts.register({
-        id: 'gts.test.pkg.ns.shape.v1~test.pkg._.good.v1',
-        $schema: 'gts.test.pkg.ns.shape.v1~',
-        a: 42,
-      });
+      gts.register({ id: 'gts.test.pkg.ns.shape.v1~test.pkg._.good.v1', a: 42 });
 
       const result = gts.castInstance('gts.test.pkg.ns.shape.v1~test.pkg._.good.v1', 'gts.test.pkg.ns.shape.v2~');
 
@@ -475,9 +467,10 @@ describe('GTS Store Operations', () => {
         required: ['name'],
       };
 
+      // A document carrying `$schema` is a schema, so an instance identifies
+      // its type through the chained `id` instead.
       const instance = {
-        gtsId: 'gts.test.pkg.ns.person.v1~test.pkg.ns.john.v1.0',
-        $schema: 'gts.test.pkg.ns.person.v1~',
+        id: 'gts.test.pkg.ns.person.v1~test.pkg.ns.john.v1.0',
         name: 'John',
         age: 30,
       };
@@ -490,8 +483,40 @@ describe('GTS Store Operations', () => {
 
       expect(result.ok).toBe(true);
       expect(result.result).toBeDefined();
-      expect(result.result.gtsId).toContain('v2');
+      // The target's default is materialized into the casted instance.
       expect(result.result.email).toBe('');
+      expect(result.result.name).toBe('John');
+    });
+
+    test('casts to a derived target that pulls its parent in through allOf', () => {
+      gts.register({
+        $$id: 'gts.test.pkg.ns.staff.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['name'],
+        properties: { name: { type: 'string' }, age: { type: 'number' } },
+      });
+      // Derived types are `allOf: [{$ref: parent}, …]` by construction, so a
+      // cast that reads `properties` without resolving the ref sees nothing
+      // and drops every value.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.staff.v1~test.pkg._.employee.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [
+          { $$ref: 'gts://gts.test.pkg.ns.staff.v1~' },
+          { type: 'object', properties: { dept: { type: 'string', default: 'unassigned' } } },
+        ],
+      });
+      gts.register({ id: 'gts.test.pkg.ns.staff.v1~test.pkg.ns.ann.v1.0', name: 'Ann', age: 41 });
+
+      const result = gts.castInstance(
+        'gts.test.pkg.ns.staff.v1~test.pkg.ns.ann.v1.0',
+        'gts.test.pkg.ns.staff.v1~test.pkg._.employee.v1~'
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.result).toMatchObject({ name: 'Ann', age: 41, dept: 'unassigned' });
     });
   });
 

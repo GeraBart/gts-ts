@@ -1,5 +1,5 @@
 import Ajv from 'ajv';
-import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX } from './types';
+import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH } from './types';
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';
 import { XGtsRefValidator } from './x-gts-ref';
@@ -389,34 +389,6 @@ export class GtsStore {
     return (s.startsWith('http://') || s.startsWith('https://')) && s.includes('json-schema.org');
   }
 
-  private inferDirection(fromId: string, toId: string): string {
-    try {
-      const fromGtsId = Gts.parseGtsID(fromId);
-      const toGtsId = Gts.parseGtsID(toId);
-
-      if (!fromGtsId.segments.length || !toGtsId.segments.length) {
-        return 'unknown';
-      }
-
-      const fromSeg = fromGtsId.segments[fromGtsId.segments.length - 1];
-      const toSeg = toGtsId.segments[toGtsId.segments.length - 1];
-
-      if (fromSeg.verMinor !== undefined && toSeg.verMinor !== undefined) {
-        if (toSeg.verMinor > fromSeg.verMinor) {
-          return 'up';
-        }
-        if (toSeg.verMinor < fromSeg.verMinor) {
-          return 'down';
-        }
-        return 'none';
-      }
-
-      return 'unknown';
-    } catch {
-      return 'unknown';
-    }
-  }
-
   private flattenSchema(schema: any): any {
     const result: any = {
       properties: {},
@@ -533,7 +505,14 @@ export class GtsStore {
       const toSchemaContent = toSchema.content;
 
       // Perform the cast
-      return this.performCast(instanceId, toSchemaId, instanceContent, fromSchemaContent, toSchemaContent);
+      return this.performCast(
+        instanceId,
+        fromSchemaId,
+        toSchemaId,
+        instanceContent,
+        fromSchemaContent,
+        toSchemaContent
+      );
     } catch (error) {
       return {
         instance_id: instanceId,
@@ -546,6 +525,7 @@ export class GtsStore {
 
   private performCast(
     fromInstanceId: string,
+    fromSchemaId: string,
     toSchemaId: string,
     fromInstanceContent: any,
     fromSchemaContent: any,
@@ -555,17 +535,20 @@ export class GtsStore {
     const targetSchema = this.flattenSchema(toSchemaContent);
 
     // Determine direction
-    const direction = this.inferDirection(fromInstanceId, toSchemaId);
+    // The direction is a property of the two type schemas. Deriving it from
+    // the instance identifier compares the instance's own version against the
+    // target type and gets the answer wrong.
+    const direction = GtsCompatibility.inferDirection(fromSchemaId, toSchemaId);
 
     // Determine which is old/new based on direction
     let oldSchema: any;
     let newSchema: any;
     switch (direction) {
-      case 'up':
+      case 'upgrade':
         oldSchema = fromSchemaContent;
         newSchema = toSchemaContent;
         break;
-      case 'down':
+      case 'downgrade':
         oldSchema = toSchemaContent;
         newSchema = fromSchemaContent;
         break;
@@ -589,22 +572,14 @@ export class GtsStore {
       ''
     );
 
-    // Validate the casted instance against the target schema
+    // The cast succeeds only if its result satisfies the target type.
     let isFullyCompatible = false;
     if (casted) {
-      try {
-        const modifiedSchema = this.removeGtsConstConstraints(toSchemaContent);
-        const validate = this.ajv.compile(this.normalizeSchema(modifiedSchema));
-        const isValid = validate(casted);
-        if (!isValid) {
-          const errors =
-            validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Validation failed';
-          incompatibilityReasons.push(errors);
-        } else {
-          isFullyCompatible = true;
-        }
-      } catch (err) {
-        incompatibilityReasons.push(err instanceof Error ? err.message : String(err));
+      const validationError = this.validateCastResult(toSchemaContent, casted);
+      if (validationError) {
+        incompatibilityReasons.push(validationError);
+      } else {
+        isFullyCompatible = true;
       }
     }
 
@@ -794,10 +769,18 @@ export class GtsStore {
     try {
       const modifiedSchema = this.removeGtsConstConstraints(toSchema);
       const validate = this.ajv.compile(this.normalizeSchema(modifiedSchema));
-      if (validate(casted)) {
-        return null;
+      if (!validate(casted)) {
+        return validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Validation failed';
       }
-      return validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Validation failed';
+
+      // `x-gts-ref` is an assertion enforced on instances (§9.6), so a cast
+      // result has to satisfy it just as a registered instance would.
+      const xGtsRefErrors = new XGtsRefValidator(this).validateInstance(casted, toSchema);
+      if (xGtsRefErrors.length > 0) {
+        return `x-gts-ref validation failed: ${xGtsRefErrors.map((err) => err.reason).join('; ')}`;
+      }
+
+      return null;
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
@@ -874,32 +857,10 @@ export class GtsStore {
 
     const content = entity.content;
 
-    // §9.11.1 - the modifiers must be well-formed on the schema itself
-    const declarationError = GtsModifiers.validateDeclaration(content);
-    if (declarationError) {
-      return { id: schemaId, ok: false, error: declarationError };
-    }
-
-    // §9.7.1 / §9.11.5 - placement is "always enforced on explicit validation
-    // endpoints", so it is checked here as well as at registration; otherwise
-    // /validate-type-schema would accept what /entities?validate=true rejects.
-    const misplaced = GtsModifiers.findMisplacedKeywords(content);
-    if (misplaced.length > 0) {
-      return {
-        id: schemaId,
-        ok: false,
-        error: `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`,
-      };
-    }
-
-    // §9.11.2 item 2 - a final type anywhere in the base chain blocks derivation
-    const finalBase = this.findFinalBaseInChain(schemaId);
-    if (finalBase) {
-      return {
-        id: schemaId,
-        ok: false,
-        error: `base type '${finalBase}' is final and cannot be extended`,
-      };
+    // §9.11.5 - the explicit validation endpoints always enforce the guards.
+    const ruleError = this.checkTypeSchemaRules(content, schemaId, { enforceGuards: true });
+    if (ruleError) {
+      return { id: schemaId, ok: false, error: ruleError };
     }
 
     // Per ADR-0001 derivation is established by the chained `$id` alone, so the
@@ -1085,7 +1046,10 @@ export class GtsStore {
    * Returns a description of the first problem found, or null when satisfiable.
    */
   private findUnsatisfiableTrait(branches: any[], path: string, depth: number = 0): string | null {
-    if (depth > 32) return null;
+    // Fail closed: an unexplored branch is reported rather than assumed fine.
+    if (depth > MAX_SCHEMA_DEPTH) {
+      return `trait schema at '${path}' nests deeper than ${MAX_SCHEMA_DEPTH} levels and cannot be verified`;
+    }
 
     const objectBranches = branches.filter((b) => typeof b === 'object' && b !== null);
     if (objectBranches.length === 0) return null;
@@ -1113,9 +1077,10 @@ export class GtsStore {
         }
       }
 
-      const conflict = this.findTypeConflict(subSchemas);
+      const conflict =
+        this.findTypeConflict(subSchemas) || this.findValueConflict(subSchemas) || this.findBoundConflict(subSchemas);
       if (conflict) {
-        return `trait '${propPath}' has conflicting types across the chain: ${conflict}`;
+        return `trait '${propPath}' cannot be satisfied: ${conflict}`;
       }
 
       const nested = this.findUnsatisfiableTrait(subSchemas, propPath, depth + 1);
@@ -1151,6 +1116,65 @@ export class GtsStore {
   }
 
   /**
+   * Returns a description when the `const` / `enum` value sets across
+   * subschemas leave no value that satisfies every branch.
+   */
+  private findValueConflict(subSchemas: any[]): string | null {
+    let allowed: any[] | null = null;
+    const seen: string[] = [];
+
+    for (const subSchema of subSchemas) {
+      if (typeof subSchema !== 'object' || subSchema === null) continue;
+
+      let values: any[] | null = null;
+      if ('const' in subSchema) values = [subSchema.const];
+      else if (Array.isArray(subSchema.enum)) values = subSchema.enum;
+      if (values === null) continue;
+
+      seen.push(JSON.stringify(values));
+      if (allowed === null) {
+        allowed = values;
+        continue;
+      }
+      allowed = allowed.filter((a) => values.some((b) => JSON.stringify(a) === JSON.stringify(b)));
+      if (allowed.length === 0) {
+        return `no value satisfies every declared const/enum (${seen.join(' vs ')})`;
+      }
+    }
+
+    return null;
+  }
+
+  /** Returns a description when the numeric bounds across subschemas cross over. */
+  private findBoundConflict(subSchemas: any[]): string | null {
+    const strictest = (key: string, pick: (a: number, b: number) => number): number | undefined => {
+      let value: number | undefined;
+      for (const subSchema of subSchemas) {
+        const candidate = typeof subSchema === 'object' && subSchema !== null ? subSchema[key] : undefined;
+        if (typeof candidate !== 'number') continue;
+        value = value === undefined ? candidate : pick(value, candidate);
+      }
+      return value;
+    };
+
+    const pairs: Array<[string, string]> = [
+      ['minimum', 'maximum'],
+      ['minLength', 'maxLength'],
+      ['minItems', 'maxItems'],
+    ];
+
+    for (const [minKey, maxKey] of pairs) {
+      const min = strictest(minKey, Math.max);
+      const max = strictest(maxKey, Math.min);
+      if (min !== undefined && max !== undefined && min > max) {
+        return `${minKey} ${min} exceeds ${maxKey} ${max} once the chain is composed`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * JSON Merge Patch (RFC 7396): objects merge recursively, every other value
    * replaces wholesale, and a `null` deletes the key.
    */
@@ -1175,6 +1199,51 @@ export class GtsStore {
   }
 
   // Build the schema chain from base to leaf for a given schema ID
+  /**
+   * The document-level GTS rules for a type schema (§9.7.1, §9.11), in one
+   * place so that every entry point enforces the same set.
+   *
+   * A malformed modifier declaration always fails: the document cannot be
+   * interpreted at all. The remaining rules are the "guards" of §9.11.5 - they
+   * run when validation is enabled at registration, and unconditionally on the
+   * explicit validation endpoints.
+   *
+   * Returns an error message, or null when the document passes.
+   */
+  checkTypeSchemaRules(content: any, id: string | undefined, options: { enforceGuards: boolean }): string | null {
+    const declarationError = GtsModifiers.validateDeclaration(content);
+    if (declarationError) {
+      return declarationError;
+    }
+
+    if (!options.enforceGuards) {
+      return null;
+    }
+
+    const misplaced = GtsModifiers.findMisplacedKeywords(content);
+    if (misplaced.length > 0) {
+      return `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`;
+    }
+
+    const finalBase = id ? this.findFinalBaseInChain(id) : null;
+    if (finalBase) {
+      return `base type '${finalBase}' is final and cannot be extended`;
+    }
+
+    return null;
+  }
+
+  /**
+   * The document-level GTS rule for an instance: its rightmost type must be
+   * instantiable (§9.11.3 item 1). Returns an error message, or null.
+   */
+  checkInstanceRules(typeId: string | null | undefined): string | null {
+    if (typeId && this.isAbstractType(typeId)) {
+      return `Type '${typeId}' is abstract and cannot be directly instantiated`;
+    }
+    return null;
+  }
+
   /**
    * Returns the id of the first base type in the `$id` chain of `schemaId` that
    * is marked `x-gts-final`, or null when the chain is derivable (§9.11.2).
@@ -1227,7 +1296,11 @@ export class GtsStore {
 
   // Resolve $ref inside a trait schema, detecting cycles
   private resolveTraitSchemaRefs(schema: any, visited: Set<string>, depth: number = 0): any {
-    if (depth > 64) return schema;
+    // Returning the unresolved schema would silently drop the constraints
+    // behind the remaining refs, so the caller is told instead.
+    if (depth > MAX_SCHEMA_DEPTH) {
+      throw new Error(`x-gts-traits-schema nests deeper than ${MAX_SCHEMA_DEPTH} levels and cannot be resolved`);
+    }
     if (typeof schema !== 'object' || schema === null) return schema;
 
     const result: any = {};
@@ -1237,16 +1310,18 @@ export class GtsStore {
         const refUri = value as string;
         const refId = refUri.startsWith(GTS_URI_PREFIX) ? refUri.substring(GTS_URI_PREFIX.length) : refUri;
 
+        // `visited` tracks the active recursion path, not every reference seen
+        // anywhere: two siblings may legitimately point at the same trait
+        // schema, and only a reference back into its own ancestry is a cycle.
         if (visited.has(refId)) {
           throw new Error(`Cyclic reference detected in trait schema: ${refId}`);
         }
-        visited.add(refId);
 
         const refEntity = this.get(refId);
         if (!refEntity || !refEntity.content) {
           throw new Error(`Unresolvable trait schema reference: ${refUri}`);
         }
-        const resolved = this.resolveTraitSchemaRefs(refEntity.content, visited, depth + 1);
+        const resolved = this.resolveTraitSchemaRefs(refEntity.content, new Set(visited).add(refId), depth + 1);
         // Merge resolved content into result
         for (const [rk, rv] of Object.entries(resolved)) {
           if (rk !== '$id' && rk !== '$$id' && rk !== '$schema' && rk !== '$$schema') {
@@ -1257,7 +1332,8 @@ export class GtsStore {
       }
 
       if (key === 'allOf' && Array.isArray(value)) {
-        result.allOf = (value as any[]).map((item) => this.resolveTraitSchemaRefs(item, visited, depth + 1));
+        // Each branch gets its own path, so sibling branches may reuse a ref.
+        result.allOf = (value as any[]).map((item) => this.resolveTraitSchemaRefs(item, new Set(visited), depth + 1));
       } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
         result[key] = this.resolveTraitSchemaRefs(value, new Set(visited), depth + 1);
       } else {
@@ -1285,7 +1361,7 @@ export class GtsStore {
   // Collect all properties from a trait schema (handling allOf composition)
   private collectAllTraitProperties(schema: any, depth: number = 0): Record<string, any> {
     const props: Record<string, any> = {};
-    if (depth > 64 || typeof schema !== 'object' || schema === null) return props;
+    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) return props;
 
     if (typeof schema.properties === 'object' && schema.properties !== null) {
       Object.assign(props, schema.properties);
@@ -1302,7 +1378,13 @@ export class GtsStore {
 
   // Detect cyclic $$ref/$ref references reachable from a schema's content
   private detectRefCycle(originId: string, content: any, visited: Set<string>, depth: number = 0): string | null {
-    if (depth > 64 || !content || typeof content !== 'object') return null;
+    // Fail closed, and separately from the non-object base case: `null` means
+    // "no cycle here", so returning it on overflow would let a cycle that sits
+    // below the limit pass unexamined.
+    if (depth > MAX_SCHEMA_DEPTH) {
+      return `reference chain from '${originId}' exceeds ${MAX_SCHEMA_DEPTH} levels and cannot be checked for cycles`;
+    }
+    if (!content || typeof content !== 'object') return null;
 
     // Check direct ref on this object
     const ref = content['$$ref'] || content['$ref'];

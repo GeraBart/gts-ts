@@ -10,6 +10,8 @@
  * the two trait keywords, so the placement check covers all four.
  */
 
+import { MAX_SCHEMA_DEPTH } from './types';
+
 export const X_GTS_FINAL = 'x-gts-final';
 export const X_GTS_ABSTRACT = 'x-gts-abstract';
 export const X_GTS_TRAITS = 'x-gts-traits';
@@ -20,8 +22,6 @@ export const X_GTS_TRAITS_SCHEMA = 'x-gts-traits-schema';
  * the top level of the schema document (§9.7.1, §9.11.2 item 5, §9.11.3 item 6).
  */
 export const DOCUMENT_LEVEL_KEYWORDS = [X_GTS_FINAL, X_GTS_ABSTRACT, X_GTS_TRAITS_SCHEMA, X_GTS_TRAITS];
-
-const MAX_DEPTH = 64;
 
 export class GtsModifiers {
   /** True when the schema declares `x-gts-final: true`; `false`/absent are no-ops. */
@@ -88,8 +88,8 @@ export class GtsModifiers {
     // The guard bounds recursion on pathological input. Stopping silently would
     // let a misplaced keyword below the limit through, so it fails closed: the
     // unscanned subtree is itself reported and the document is rejected.
-    if (depth > MAX_DEPTH) {
-      found.push(`${path} (nesting exceeds ${MAX_DEPTH} levels; cannot verify keyword placement)`);
+    if (depth > MAX_SCHEMA_DEPTH) {
+      found.push(`${path} (nesting exceeds ${MAX_SCHEMA_DEPTH} levels; cannot verify keyword placement)`);
       return;
     }
 

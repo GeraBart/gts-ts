@@ -4,7 +4,6 @@ export { GtsExtractor } from './extract';
 export { GtsStore, createJsonEntity } from './store';
 export { GtsRelationships } from './relationships';
 export { GtsCompatibility } from './compatibility';
-export { GtsCast } from './cast';
 export { GtsQuery } from './query';
 export { GtsModifiers, DOCUMENT_LEVEL_KEYWORDS } from './modifiers';
 
@@ -13,7 +12,6 @@ import { GtsExtractor } from './extract';
 import { GtsStore, createJsonEntity } from './store';
 import { GtsRelationships } from './relationships';
 import { GtsCompatibility } from './compatibility';
-import { GtsCast } from './cast';
 import { GtsQuery } from './query';
 import {
   ValidationResult,
@@ -90,8 +88,22 @@ export class GTS {
     return GtsCompatibility.checkCompatibility(this.store, oldId, newId, mode);
   }
 
-  castInstance(fromId: string, toSchemaId: string): CastResult {
-    return GtsCast.castInstance(this.store, fromId, toSchemaId);
+  /**
+   * OP#9 - cast an instance to another version of its type.
+   *
+   * Delegates to the registry implementation so that the library, the CLI and
+   * `POST /cast` all share one cast: it resolves `allOf` / `$ref` on the target
+   * before transforming, and validates the result against the target type.
+   */
+  castInstance(fromId: string, toTypeId: string): CastResult {
+    const result = this.store.castInstance(fromId, toTypeId);
+    return {
+      ok: result.ok,
+      fromId,
+      toId: toTypeId,
+      result: result.casted_entity ?? undefined,
+      error: result.error || undefined,
+    };
   }
 
   validateEntity(id: string): ValidationResult & { entity_type: string } {

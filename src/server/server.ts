@@ -1,7 +1,6 @@
 import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { GTS, createJsonEntity } from '../index';
 import { XGtsRefValidator } from '../x-gts-ref';
-import { GtsModifiers } from '../modifiers';
 import {
   ServerConfig,
   EntityResponse,
@@ -178,46 +177,15 @@ export class GtsServer {
 
       // §9.11.1 - a malformed modifier declaration is always rejected: the
       // document cannot be interpreted, so there is nothing to register.
-      if (entity.isSchema) {
-        const declarationError = GtsModifiers.validateDeclaration(content);
-        if (declarationError) {
-          reply.code(422);
-          return { ok: false, error: declarationError };
-        }
-      }
-
-      // Strict validation for schemas when validate=true
-      if (validate && entity.isSchema) {
-        // §9.7.1 / §9.11.5 - document-level keywords must sit at the top level
-        const misplaced = GtsModifiers.findMisplacedKeywords(content);
-        if (misplaced.length > 0) {
-          reply.code(422);
-          return {
-            ok: false,
-            error: `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`,
-          };
-        }
-
-        // §9.11.2 item 1 - registration guard: cannot derive from a final base
-        const finalBase = entity.id ? this.store['store'].findFinalBaseInChain(entity.id) : null;
-        if (finalBase) {
-          reply.code(422);
-          return {
-            ok: false,
-            error: `base type '${finalBase}' is final and cannot be extended`,
-          };
-        }
-      }
-
-      // §9.11.3 item 1 - registration guard: no direct instances of an abstract type
-      if (validate && !entity.isSchema && entity.schemaId) {
-        if (this.store['store'].isAbstractType(entity.schemaId)) {
-          reply.code(422);
-          return {
-            ok: false,
-            error: `Type '${entity.schemaId}' is abstract and cannot be directly instantiated`,
-          };
-        }
+      // The guards beyond that are gated on `validate` per §9.11.5.
+      const ruleError = entity.isSchema
+        ? this.store['store'].checkTypeSchemaRules(content, entity.id, { enforceGuards: validate })
+        : validate
+          ? this.store['store'].checkInstanceRules(entity.schemaId)
+          : null;
+      if (ruleError) {
+        reply.code(422);
+        return { ok: false, error: ruleError };
       }
 
       if (validate && entity.isSchema) {
@@ -413,9 +381,11 @@ export class GtsServer {
         try {
           const entity = createJsonEntity(content);
 
-          // A malformed modifier declaration is rejected on every registration
-          // path, so the bulk endpoint applies the same check as POST /entities.
-          const declarationError = entity.isSchema ? GtsModifiers.validateDeclaration(content) : null;
+          // The bulk endpoint has no `validate` switch, so it applies the same
+          // always-on rules as POST /entities and none of the gated guards.
+          const declarationError = entity.isSchema
+            ? this.store['store'].checkTypeSchemaRules(content, entity.id, { enforceGuards: false })
+            : null;
           if (declarationError) {
             errors.push(declarationError);
             continue;

@@ -1,4 +1,4 @@
-import { CompatibilityResult, CompatVerdict, GTS_URI_PREFIX } from './types';
+import { CompatibilityResult, CompatVerdict, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH } from './types';
 import { GtsStore } from './store';
 import { Gts } from './gts';
 
@@ -19,77 +19,143 @@ import { Gts } from './gts';
  * it with incompatibility.
  */
 
-/** JSON Schema keywords that carry documentation only and never change Valid(S) (§4.3). */
-const ANNOTATION_KEYWORDS = new Set([
-  'title',
-  'description',
-  'examples',
-  'default',
-  'deprecated',
-  'readOnly',
-  'writeOnly',
-  '$comment',
-  '$id',
-  '$$id',
-  '$schema',
-  '$$schema',
-  '$defs',
-  'definitions',
-  // Draft-07 treats `format` as an annotation unless assertion is enabled.
-  'format',
-]);
-
-/** Keywords the subsumption engine reasons about directly. */
-const MODELED_KEYWORDS = new Set([
-  'type',
-  'enum',
-  'const',
-  'properties',
-  'required',
-  'additionalProperties',
-  'unevaluatedProperties',
-  'items',
-  'minimum',
-  'maximum',
-  'exclusiveMinimum',
-  'exclusiveMaximum',
-  'minLength',
-  'maxLength',
-  'minItems',
-  'maxItems',
-  'allOf',
-  '$ref',
-  '$$ref',
-]);
-
 /**
- * Constraining keywords the engine does not model. When these differ between
- * the two schemas the comparison is inconclusive and yields `unknown` rather
- * than a guessed verdict.
+ * How the engine treats each schema keyword.
+ *
+ * - `annotation`  - documentation only; never changes Valid(S) (§4.3).
+ * - `composition` - folded into the effective schema before comparison.
+ * - `modeled`     - compared directly by one of the `compare*` methods.
+ * - `unmodeled`   - a real assertion the engine cannot reason about; a
+ *                   difference makes the comparison inconclusive (`unknown`).
+ *
+ * This is the single source of truth. Everything below - what gets stripped,
+ * which keywords mean "this level constrains objects", which axis a bound sits
+ * on - is derived from it, so a keyword cannot end up classified one way in one
+ * place and another way somewhere else. Anything absent from the table is
+ * treated as `unmodeled`, which fails closed rather than being ignored.
  */
-const UNMODELED_ASSERTIONS = [
-  'oneOf',
-  'anyOf',
-  'not',
-  'if',
-  'then',
-  'else',
-  'pattern',
-  'patternProperties',
-  'propertyNames',
-  'dependencies',
-  'dependentSchemas',
-  'dependentRequired',
-  'multipleOf',
-  'contains',
-  'additionalItems',
-  'uniqueItems',
-  // Enforced against instances by OP#6, but the engine does not model whether
-  // one reference pattern subsumes another.
-  'x-gts-ref',
-];
+type KeywordKind = 'annotation' | 'composition' | 'modeled' | 'unmodeled';
 
-const MAX_DEPTH = 32;
+interface KeywordSpec {
+  kind: KeywordKind;
+  /** Set when the keyword constrains the object content model at its level. */
+  object?: boolean;
+  /** Set when the keyword is a numeric bound, naming its axis and whether it excludes the endpoint. */
+  bound?: { axis: 'minimum' | 'maximum' | 'length' | 'items'; exclusive: boolean };
+  /**
+   * Shape a `modeled` keyword's value must have for the engine to reason about
+   * it. Schemas are registered without meta-validation, so a value of the wrong
+   * shape is possible; when one appears the comparison is inconclusive rather
+   * than silently treated as "no constraint".
+   */
+  shape?: (value: unknown) => boolean;
+}
+
+const isObject = (v: unknown) => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isSchemaValue = (v: unknown) => typeof v === 'boolean' || isObject(v);
+const isNumber = (v: unknown) => typeof v === 'number';
+const isStringOrStringArray = (v: unknown) =>
+  typeof v === 'string' || (Array.isArray(v) && v.every((t) => typeof t === 'string'));
+
+const KEYWORDS: Record<string, KeywordSpec> = {
+  // Documentation and identity
+  title: { kind: 'annotation' },
+  description: { kind: 'annotation' },
+  examples: { kind: 'annotation' },
+  default: { kind: 'annotation' },
+  deprecated: { kind: 'annotation' },
+  readOnly: { kind: 'annotation' },
+  writeOnly: { kind: 'annotation' },
+  $comment: { kind: 'annotation' },
+  $id: { kind: 'annotation' },
+  $$id: { kind: 'annotation' },
+  $schema: { kind: 'annotation' },
+  $$schema: { kind: 'annotation' },
+  $defs: { kind: 'annotation' },
+  definitions: { kind: 'annotation' },
+  // Draft-07 treats `format` as an annotation unless assertion is enabled.
+  format: { kind: 'annotation' },
+
+  // Folded in by the resolver before anything is compared
+  allOf: { kind: 'composition' },
+  $ref: { kind: 'composition' },
+  $$ref: { kind: 'composition' },
+
+  // Compared directly
+  type: { kind: 'modeled', shape: isStringOrStringArray },
+  enum: { kind: 'modeled', shape: Array.isArray },
+  const: { kind: 'modeled' },
+  items: { kind: 'modeled', shape: (v) => isSchemaValue(v) || Array.isArray(v) },
+  properties: { kind: 'modeled', object: true, shape: isObject },
+  required: { kind: 'modeled', object: true, shape: (v) => Array.isArray(v) && v.every((n) => typeof n === 'string') },
+  additionalProperties: { kind: 'modeled', object: true, shape: isSchemaValue },
+  unevaluatedProperties: { kind: 'modeled', object: true, shape: isSchemaValue },
+  minimum: { kind: 'modeled', bound: { axis: 'minimum', exclusive: false }, shape: isNumber },
+  exclusiveMinimum: { kind: 'modeled', bound: { axis: 'minimum', exclusive: true }, shape: isNumber },
+  maximum: { kind: 'modeled', bound: { axis: 'maximum', exclusive: false }, shape: isNumber },
+  exclusiveMaximum: { kind: 'modeled', bound: { axis: 'maximum', exclusive: true }, shape: isNumber },
+  minLength: { kind: 'modeled', bound: { axis: 'length', exclusive: false }, shape: isNumber },
+  maxLength: { kind: 'modeled', bound: { axis: 'length', exclusive: false }, shape: isNumber },
+  minItems: { kind: 'modeled', bound: { axis: 'items', exclusive: false }, shape: isNumber },
+  maxItems: { kind: 'modeled', bound: { axis: 'items', exclusive: false }, shape: isNumber },
+
+  // Real assertions the engine does not model
+  oneOf: { kind: 'unmodeled' },
+  anyOf: { kind: 'unmodeled' },
+  not: { kind: 'unmodeled' },
+  if: { kind: 'unmodeled' },
+  then: { kind: 'unmodeled' },
+  else: { kind: 'unmodeled' },
+  pattern: { kind: 'unmodeled' },
+  patternProperties: { kind: 'unmodeled', object: true },
+  propertyNames: { kind: 'unmodeled', object: true },
+  dependencies: { kind: 'unmodeled', object: true },
+  dependentSchemas: { kind: 'unmodeled', object: true },
+  dependentRequired: { kind: 'unmodeled', object: true },
+  multipleOf: { kind: 'unmodeled' },
+  contains: { kind: 'unmodeled' },
+  additionalItems: { kind: 'unmodeled' },
+  uniqueItems: { kind: 'unmodeled' },
+  // Enforced against instances by OP#6 (§9.6), so it is an assertion, not an
+  // annotation - even though it shares the `x-gts-` prefix with the type-level
+  // keywords that genuinely are metadata.
+  'x-gts-ref': { kind: 'unmodeled' },
+};
+
+function keywordKind(key: string): KeywordKind {
+  const spec = KEYWORDS[key];
+  if (spec) return spec.kind;
+  // The remaining `x-gts-*` keywords describe the type, not the instance.
+  if (key.startsWith('x-gts-')) return 'annotation';
+  // Unrecognised keywords are assumed to constrain something.
+  return 'unmodeled';
+}
+
+/** True when any modeled keyword on this schema carries a value the engine cannot read. */
+function hasMalformedKeyword(schema: Schema): boolean {
+  if (typeof schema !== 'object' || schema === null) return false;
+  return Object.entries(schema).some(([key, value]) => {
+    const spec = KEYWORDS[key];
+    return spec?.kind === 'modeled' && spec.shape !== undefined && !spec.shape(value);
+  });
+}
+
+/** Keywords whose presence means this level says something about object content. */
+const OBJECT_KEYWORDS = Object.keys(KEYWORDS).filter((key) => KEYWORDS[key].object);
+
+/** The bound keywords grouped by axis, for normalized `(value, exclusive)` comparison. */
+const BOUND_AXES: Array<{ axis: string; isLower: boolean; keywords: Array<{ key: string; exclusive: boolean }> }> = [
+  { axis: 'minimum', isLower: true, keywords: [] },
+  { axis: 'maximum', isLower: false, keywords: [] },
+  { axis: 'minLength', isLower: true, keywords: [{ key: 'minLength', exclusive: false }] },
+  { axis: 'maxLength', isLower: false, keywords: [{ key: 'maxLength', exclusive: false }] },
+  { axis: 'minItems', isLower: true, keywords: [{ key: 'minItems', exclusive: false }] },
+  { axis: 'maxItems', isLower: false, keywords: [{ key: 'maxItems', exclusive: false }] },
+];
+for (const [key, spec] of Object.entries(KEYWORDS)) {
+  if (spec.bound?.axis === 'minimum') BOUND_AXES[0].keywords.push({ key, exclusive: spec.bound.exclusive });
+  if (spec.bound?.axis === 'maximum') BOUND_AXES[1].keywords.push({ key, exclusive: spec.bound.exclusive });
+}
 
 /** A schema whose accepted set is everything, used for undeclared properties of an open model. */
 const ANY_SCHEMA = true;
@@ -116,19 +182,7 @@ function deepEqual(a: any, b: any): boolean {
   return aKeys.length === bKeys.length && aKeys.every((k) => k in b && deepEqual(a[k], b[k]));
 }
 
-/**
- * `x-gts-*` keywords describe the type rather than the instance, so they do not
- * change Valid(S) - with one exception. `x-gts-ref` is enforced against
- * instances during OP#6 validation, which makes it an assertion: two schemas
- * whose reference patterns accept disjoint targets do not accept the same
- * instances. It is therefore never stripped, and is compared as an unmodeled
- * assertion instead.
- */
-function isStrippableGtsKeyword(key: string): boolean {
-  return key.startsWith('x-gts-') && key !== 'x-gts-ref';
-}
-
-/** Strip annotations and GTS keywords so that documentation-only edits compare equal. */
+/** Strip annotations so that documentation-only edits compare equal. */
 function stripAnnotations(schema: Schema): Schema {
   if (typeof schema === 'boolean') return schema;
   if (schema === null || typeof schema !== 'object') return schema;
@@ -136,7 +190,7 @@ function stripAnnotations(schema: Schema): Schema {
 
   const out: Record<string, any> = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (ANNOTATION_KEYWORDS.has(key) || isStrippableGtsKeyword(key)) continue;
+    if (keywordKind(key) === 'annotation') continue;
     out[key] = stripAnnotations(value);
   }
   return out;
@@ -305,7 +359,13 @@ class SchemaResolver {
     if (schema === false) return false;
     if (schema === true || schema === undefined || schema === null) return {};
     if (typeof schema !== 'object') return {};
-    if (depth > MAX_DEPTH) return {};
+    // Bailing out here leaves part of the schema uninspected. Recording it as
+    // an unresolved reference makes `finalize()` downgrade the verdict to
+    // `unknown`, instead of returning {} which reads as "no constraints".
+    if (depth > MAX_SCHEMA_DEPTH) {
+      this.unresolved = true;
+      return {};
+    }
 
     const { allOf, $ref, $$ref, ...rest } = schema as Record<string, any>;
     let effective: Schema = rest;
@@ -362,7 +422,7 @@ class SubsumptionChecker {
 
   /** Verdict for `Valid(inner) subset-of Valid(outer)`. */
   subsumes(outerRaw: Schema, innerRaw: Schema, depth = 0): CompatVerdict {
-    if (depth > MAX_DEPTH) return 'unknown';
+    if (depth > MAX_SCHEMA_DEPTH) return 'unknown';
 
     const outer = this.resolver.resolve(outerRaw, depth);
     const inner = this.resolver.resolve(innerRaw, depth);
@@ -374,6 +434,11 @@ class SubsumptionChecker {
     const outerNorm = stripAnnotations(outer);
     const innerNorm = stripAnnotations(inner);
     if (deepEqual(outerNorm, innerNorm)) return this.finalize('compatible');
+
+    // A modeled keyword whose value has the wrong shape is not a constraint the
+    // engine can reason about. Treating it as absent would read as "no
+    // constraint" and pass, so the comparison is inconclusive instead.
+    if (hasMalformedKeyword(outerNorm) || hasMalformedKeyword(innerNorm)) return 'unknown';
 
     let verdict: CompatVerdict = 'compatible';
     verdict = worst(verdict, this.compareTypes(outerNorm, innerNorm));
@@ -406,38 +471,11 @@ class SubsumptionChecker {
   }
 
   private compareBounds(outer: Schema, inner: Schema): CompatVerdict {
-    const BOUND_KEYWORDS = [
-      'minimum',
-      'exclusiveMinimum',
-      'maximum',
-      'exclusiveMaximum',
-      'minLength',
-      'maxLength',
-      'minItems',
-      'maxItems',
-    ];
-
-    // A bound present but not numeric is a malformed schema, not a constraint
-    // the engine can reason about, so the comparison is inconclusive.
-    const malformed = (schema: Schema, key: string) => key in schema && typeof schema[key] !== 'number';
-    for (const key of BOUND_KEYWORDS) {
-      if (malformed(outer, key) || malformed(inner, key)) return 'unknown';
-    }
-
     // The inclusive and exclusive forms constrain the same axis, so they are
     // normalized to (value, exclusive) before being compared. Without this,
     // `minimum: 0` and `exclusiveMinimum: 0` look like unrelated keywords even
     // though `x > 0` is a strict subset of `x >= 0`.
-    const axes: Array<{ inclusive: string; exclusive?: string; isLower: boolean }> = [
-      { inclusive: 'minimum', exclusive: 'exclusiveMinimum', isLower: true },
-      { inclusive: 'maximum', exclusive: 'exclusiveMaximum', isLower: false },
-      { inclusive: 'minLength', isLower: true },
-      { inclusive: 'maxLength', isLower: false },
-      { inclusive: 'minItems', isLower: true },
-      { inclusive: 'maxItems', isLower: false },
-    ];
-
-    for (const axis of axes) {
+    for (const axis of BOUND_AXES) {
       const outerBound = this.readBound(outer, axis);
       if (outerBound === null) continue; // outer constrains nothing on this axis
       const innerBound = this.readBound(inner, axis);
@@ -452,14 +490,12 @@ class SubsumptionChecker {
   /** The effective bound on one axis as `(value, exclusive)`, or null when unconstrained. */
   private readBound(
     schema: Schema,
-    axis: { inclusive: string; exclusive?: string; isLower: boolean }
+    axis: { isLower: boolean; keywords: Array<{ key: string; exclusive: boolean }> }
   ): { value: number; exclusive: boolean } | null {
-    const inclusive = schema[axis.inclusive];
-    const exclusive = axis.exclusive ? schema[axis.exclusive] : undefined;
-
     const candidates: Array<{ value: number; exclusive: boolean }> = [];
-    if (typeof inclusive === 'number') candidates.push({ value: inclusive, exclusive: false });
-    if (typeof exclusive === 'number') candidates.push({ value: exclusive, exclusive: true });
+    for (const { key, exclusive } of axis.keywords) {
+      if (typeof schema[key] === 'number') candidates.push({ value: schema[key], exclusive });
+    }
     if (candidates.length === 0) return null;
 
     // Both forms present: the tighter one wins, matching `allOf` conjunction.
@@ -483,14 +519,11 @@ class SubsumptionChecker {
   private compareObjects(outer: Schema, inner: Schema, depth: number): CompatVerdict {
     const outerProps: Record<string, any> = outer.properties || {};
     const innerProps: Record<string, any> = inner.properties || {};
-    const hasObjectKeywords =
-      'properties' in outer ||
-      'properties' in inner ||
-      'required' in outer ||
-      'required' in inner ||
-      'additionalProperties' in outer ||
-      'additionalProperties' in inner;
-    if (!hasObjectKeywords) return 'compatible';
+    // Derived from the keyword table, so a keyword that affects the content
+    // model - `unevaluatedProperties`, say - cannot be honoured by
+    // `contentModel()` while being invisible to this guard.
+    const constrainsObjects = OBJECT_KEYWORDS.some((key) => key in outer || key in inner);
+    if (!constrainsObjects) return 'compatible';
 
     // Outer may not demand a property the inner schema allows to be absent.
     const outerRequired: string[] = outer.required || [];
@@ -542,20 +575,13 @@ class SubsumptionChecker {
   }
 
   private compareUnmodeled(outer: Schema, inner: Schema): CompatVerdict {
-    for (const key of UNMODELED_ASSERTIONS) {
-      const inOuter = key in outer;
-      const inInner = key in inner;
-      if (!inOuter && !inInner) continue;
-      if (!deepEqual(outer[key], inner[key])) return 'unknown';
-    }
-
-    // Any other keyword we neither model nor recognise as an annotation.
-    const extraKeys = new Set(
-      [...Object.keys(outer), ...Object.keys(inner)].filter(
-        (k) => !MODELED_KEYWORDS.has(k) && !UNMODELED_ASSERTIONS.includes(k)
-      )
-    );
-    for (const key of extraKeys) {
+    // Every keyword either side declares that the engine does not compare
+    // directly. `keywordKind` classifies unrecognised keywords as `unmodeled`,
+    // so a keyword nobody has thought about yet fails closed to `unknown`
+    // rather than being silently ignored.
+    const keys = new Set([...Object.keys(outer), ...Object.keys(inner)]);
+    for (const key of keys) {
+      if (keywordKind(key) !== 'unmodeled') continue;
       if (!deepEqual(outer[key], inner[key])) return 'unknown';
     }
 
@@ -669,7 +695,14 @@ export class GtsCompatibility {
     };
   }
 
-  private static inferDirection(fromId: string, toId: string): string {
+  /**
+   * Classifies the version step between two identifiers as
+   * `upgrade` / `downgrade` / `same` / `unknown`.
+   *
+   * Shared by OP#8 and OP#9 so the `direction` field means the same thing on
+   * `GET /compatibility` and `POST /cast`.
+   */
+  static inferDirection(fromId: string, toId: string): string {
     try {
       const fromGtsId = Gts.parseGtsID(fromId);
       const toGtsId = Gts.parseGtsID(toId);

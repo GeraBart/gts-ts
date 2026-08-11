@@ -56,10 +56,26 @@ The previous boolean fields (`is_backward_compatible`, `is_forward_compatible`,
   accepted-instance sets rather than by diffing properties, so it no longer produces a
   property diff. The fields remain on the type and in the `GET /compatibility` response so
   existing consumers keep parsing, but they carry no information and will be removed.
-- `GtsCast.castInstance()` no longer refuses when the two type schemas are not fully
-  compatible. Casting is a separate operational contract that the spec requires to be
-  reported separately from schema compatibility (§4.3, §4.6.3); under 0.13 almost no real
-  schema evolution is *fully* compatible, so the old gate rejected ordinary casts.
+- **`GtsCast` was removed.** There were two cast implementations - one in the library, one
+  in the registry. Only the registry implementation resolved `allOf` / `$ref` on the target
+  and validated the cast result; the library one did neither. Since GTS derived types *are*
+  `allOf: [{$ref: parent}, …]`, the library version silently dropped every property when
+  casting to a derived type.
+  `GTS.castInstance()`, the CLI and `POST /cast` now share the registry implementation.
+  The returned `CastResult` shape is unchanged.
+- Casting no longer refuses when the two type schemas are not fully compatible. Casting is
+  a separate operational contract that the spec requires to be reported separately from
+  schema compatibility (§4.3, §4.6.3); under 0.13 almost no real schema evolution is
+  *fully* compatible, so the old gate rejected ordinary casts. A cast now succeeds only if
+  its **result** satisfies the target type, including that type's `x-gts-ref` constraints.
+- The `direction` field reported `upgrade` / `downgrade` / `same` on `GET /compatibility`
+  but `up` / `down` / `none` on `POST /cast`, from two separate implementations. Both now
+  use `upgrade` / `downgrade` / `same` / `unknown`, and consider the MAJOR version as well
+  as the MINOR.
+- Two shape checks on `x-gts-traits-schema` were dropped: it no longer has to declare
+  `type: "object"`, and it may contain a nested `x-gts-traits` member. Per ADR-0002 the
+  keyword is an ordinary JSON Schema subschema (object, `true` or `false`), so neither
+  restriction has a basis in 0.13; the placement rule deliberately does not scan inside it.
 
 ### Changed - compatibility semantics (spec 0.13 §4)
 

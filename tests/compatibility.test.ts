@@ -321,6 +321,30 @@ describe('OP#8 - malformed schemas degrade instead of throwing', () => {
     expect(() => gts.checkCompatibility(oldId, newId)).not.toThrow();
   });
 
+  test('a non-array enum makes the comparison inconclusive, not unconstrained', () => {
+    // `fixedValues()` only recognises array enums, so a malformed one used to
+    // read as "this schema pins nothing down" and compared as compatible.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.malformed.enumshape.v1.0~';
+    const newId = 'gts.x.unit.malformed.enumshape.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'string', enum: 'open' });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'string' });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+
+  test('a modeled keyword of the wrong shape makes the comparison inconclusive', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.malformed.reqshape.v1.0~';
+    const newId = 'gts.x.unit.malformed.reqshape.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'object', required: 'a', properties: { a: {} } });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'object', required: ['a'], properties: { a: {} } });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+
   test('a schema that cannot be compared at all reports unknown', () => {
     const gts = new GTS({ validateRefs: false });
     const oldId = 'gts.x.unit.malformed.cyclic.v1.0~';
@@ -479,6 +503,41 @@ describe('OP#8 - inclusive and exclusive bounds are the same axis', () => {
     expect(
       gts.checkCompatibility('gts.x.unit.bounds.same.v1.0~', 'gts.x.unit.bounds.same.v1.1~').full_compatibility
     ).toBe('compatible');
+  });
+});
+
+describe('OP#8 - the keyword table is the single source of truth', () => {
+  test('unevaluatedProperties closes a type, on every code path that reads it', () => {
+    // It was previously honoured by contentModel() but invisible to the object
+    // guard and to the unmodeled catch-all, so closing a type this way read as
+    // fully compatible in both directions.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.unevald.t.v1.0~';
+    const newId = 'gts.x.unit.unevald.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'object', properties: { a: { type: 'string' } } });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { a: { type: 'string' } },
+      unevaluatedProperties: false,
+    });
+
+    const result = gts.checkCompatibility(oldId, newId);
+    expect(result.backward_compatibility).toBe('incompatible');
+    expect(result.forward_compatibility).toBe('compatible');
+  });
+
+  test('an unrecognised keyword fails closed to unknown rather than being ignored', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.newkw.t.v1.0~';
+    const newId = 'gts.x.unit.newkw.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'string', 'x-some-future-assertion': 'a' });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'string', 'x-some-future-assertion': 'b' });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
   });
 });
 
