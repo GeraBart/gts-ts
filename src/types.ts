@@ -135,6 +135,19 @@ export interface GtsConfig {
   strictMode: boolean;
 }
 
+/**
+ * The read-only registry surface that the compatibility engine and the
+ * `x-gts-ref` validator need - entity lookup by identifier, nothing more.
+ *
+ * They depend on this instead of on `GtsStore` so that the dependency stays
+ * one-way: the registry may reach into those modules, and they only need to
+ * look entities up. `GtsStore` satisfies this structurally, so no call site
+ * changes and no import cycle.
+ */
+export interface EntityLookup {
+  get(id: string): JsonEntity | undefined;
+}
+
 export interface JsonEntity {
   id: string;
   schemaId: string | null;

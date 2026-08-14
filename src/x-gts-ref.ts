@@ -4,7 +4,7 @@
  */
 
 import { Gts } from './gts';
-import { GtsStore } from './store';
+import { EntityLookup } from './types';
 
 export interface XGtsRefValidationError {
   fieldPath: string;
@@ -14,9 +14,9 @@ export interface XGtsRefValidationError {
 }
 
 export class XGtsRefValidator {
-  private store: GtsStore;
+  private store: EntityLookup;
 
-  constructor(store: GtsStore) {
+  constructor(store: EntityLookup) {
     this.store = store;
   }
 

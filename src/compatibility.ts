@@ -1,5 +1,4 @@
-import { CompatibilityResult, CompatVerdict, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH } from './types';
-import { GtsStore } from './store';
+import { CompatibilityResult, CompatVerdict, EntityLookup, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH } from './types';
 import { Gts } from './gts';
 
 /**
@@ -416,7 +415,7 @@ function mergeSchemas(a: Schema, b: Schema): Schema {
 class SchemaResolver {
   private unresolved = false;
 
-  constructor(private store: GtsStore) {}
+  constructor(private store: EntityLookup) {}
 
   /** True when any `$ref` encountered so far could not be resolved. */
   get hadUnresolvedRef(): boolean {
@@ -536,7 +535,7 @@ export function findCrossedBound(subSchemas: Schema[]): string | null {
 class SubsumptionChecker {
   private resolver: SchemaResolver;
 
-  constructor(store: GtsStore) {
+  constructor(store: EntityLookup) {
     this.resolver = new SchemaResolver(store);
   }
 
@@ -696,7 +695,7 @@ export class GtsCompatibility {
    * reports both evolution relations.
    */
   static compareSchemas(
-    store: GtsStore,
+    store: EntityLookup,
     oldSchema: Schema,
     newSchema: Schema
   ): { backward: CompatVerdict; forward: CompatVerdict } {
@@ -707,7 +706,7 @@ export class GtsCompatibility {
   }
 
   static checkCompatibility(
-    store: GtsStore,
+    store: EntityLookup,
     oldId: string,
     newId: string,
     _mode: 'backward' | 'forward' | 'full' = 'full'
