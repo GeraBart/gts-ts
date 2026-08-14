@@ -49,6 +49,15 @@ interface KeywordSpec {
    * than silently treated as "no constraint".
    */
   shape?: (value: unknown) => boolean;
+  /**
+   * Where subschemas live under this keyword, so that a walker knows which
+   * values are schemas and which are plain data.
+   *
+   * Without this a walker cannot tell `{properties: {title: {...}}}` - where
+   * `title` is a *property name* - from a schema position where `title` is the
+   * annotation keyword, and will happily delete user data.
+   */
+  values?: 'schema' | 'schemaMap' | 'schemaList';
 }
 
 const isObject = (v: unknown) => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -71,25 +80,25 @@ const KEYWORDS: Record<string, KeywordSpec> = {
   $$id: { kind: 'annotation' },
   $schema: { kind: 'annotation' },
   $$schema: { kind: 'annotation' },
-  $defs: { kind: 'annotation' },
-  definitions: { kind: 'annotation' },
+  $defs: { kind: 'annotation', values: 'schemaMap' },
+  definitions: { kind: 'annotation', values: 'schemaMap' },
   // Draft-07 treats `format` as an annotation unless assertion is enabled.
   format: { kind: 'annotation' },
 
   // Folded in by the resolver before anything is compared
-  allOf: { kind: 'composition' },
-  $ref: { kind: 'composition' },
-  $$ref: { kind: 'composition' },
+  allOf: { kind: 'composition', values: 'schemaList', shape: Array.isArray },
+  $ref: { kind: 'composition', shape: (v) => typeof v === 'string' },
+  $$ref: { kind: 'composition', shape: (v) => typeof v === 'string' },
 
   // Compared directly
   type: { kind: 'modeled', shape: isStringOrStringArray },
   enum: { kind: 'modeled', shape: Array.isArray },
   const: { kind: 'modeled' },
-  items: { kind: 'modeled', shape: (v) => isSchemaValue(v) || Array.isArray(v) },
-  properties: { kind: 'modeled', object: true, shape: isObject },
+  items: { kind: 'modeled', values: 'schema', shape: (v) => isSchemaValue(v) || Array.isArray(v) },
+  properties: { kind: 'modeled', object: true, values: 'schemaMap', shape: isObject },
   required: { kind: 'modeled', object: true, shape: (v) => Array.isArray(v) && v.every((n) => typeof n === 'string') },
-  additionalProperties: { kind: 'modeled', object: true, shape: isSchemaValue },
-  unevaluatedProperties: { kind: 'modeled', object: true, shape: isSchemaValue },
+  additionalProperties: { kind: 'modeled', object: true, values: 'schema', shape: isSchemaValue },
+  unevaluatedProperties: { kind: 'modeled', object: true, values: 'schema', shape: isSchemaValue },
   minimum: { kind: 'modeled', bound: { axis: 'minimum', exclusive: false }, shape: isNumber },
   exclusiveMinimum: { kind: 'modeled', bound: { axis: 'minimum', exclusive: true }, shape: isNumber },
   maximum: { kind: 'modeled', bound: { axis: 'maximum', exclusive: false }, shape: isNumber },
@@ -100,21 +109,21 @@ const KEYWORDS: Record<string, KeywordSpec> = {
   maxItems: { kind: 'modeled', bound: { axis: 'items', exclusive: false }, shape: isNumber },
 
   // Real assertions the engine does not model
-  oneOf: { kind: 'unmodeled' },
-  anyOf: { kind: 'unmodeled' },
-  not: { kind: 'unmodeled' },
-  if: { kind: 'unmodeled' },
-  then: { kind: 'unmodeled' },
-  else: { kind: 'unmodeled' },
+  oneOf: { kind: 'unmodeled', values: 'schemaList' },
+  anyOf: { kind: 'unmodeled', values: 'schemaList' },
+  not: { kind: 'unmodeled', values: 'schema' },
+  if: { kind: 'unmodeled', values: 'schema' },
+  then: { kind: 'unmodeled', values: 'schema' },
+  else: { kind: 'unmodeled', values: 'schema' },
   pattern: { kind: 'unmodeled' },
-  patternProperties: { kind: 'unmodeled', object: true },
-  propertyNames: { kind: 'unmodeled', object: true },
+  patternProperties: { kind: 'unmodeled', object: true, values: 'schemaMap' },
+  propertyNames: { kind: 'unmodeled', object: true, values: 'schema' },
   dependencies: { kind: 'unmodeled', object: true },
-  dependentSchemas: { kind: 'unmodeled', object: true },
+  dependentSchemas: { kind: 'unmodeled', object: true, values: 'schemaMap' },
   dependentRequired: { kind: 'unmodeled', object: true },
   multipleOf: { kind: 'unmodeled' },
-  contains: { kind: 'unmodeled' },
-  additionalItems: { kind: 'unmodeled' },
+  contains: { kind: 'unmodeled', values: 'schema' },
+  additionalItems: { kind: 'unmodeled', values: 'schema' },
   uniqueItems: { kind: 'unmodeled' },
   // Enforced against instances by OP#6 (§9.6), so it is an assertion, not an
   // annotation - even though it shares the `x-gts-` prefix with the type-level
@@ -131,13 +140,42 @@ function keywordKind(key: string): KeywordKind {
   return 'unmodeled';
 }
 
-/** True when any modeled keyword on this schema carries a value the engine cannot read. */
-function hasMalformedKeyword(schema: Schema): boolean {
-  if (typeof schema !== 'object' || schema === null) return false;
+/**
+ * True when this schema carries a value the engine cannot read: a keyword of
+ * the wrong shape, or a subschema position holding something that is not a
+ * schema. Both would otherwise be dropped during resolution and read as
+ * "no constraint".
+ */
+function hasMalformedKeyword(schema: Schema, depth = 0): boolean {
+  if (schema === undefined) return false;
+  if (typeof schema === 'boolean') return false;
+  if (typeof schema !== 'object' || schema === null) return true;
+  if (depth > MAX_SCHEMA_DEPTH) return true;
+
   return Object.entries(schema).some(([key, value]) => {
     const spec = KEYWORDS[key];
-    return spec?.kind === 'modeled' && spec.shape !== undefined && !spec.shape(value);
+    if (spec?.shape && !spec.shape(value)) return true;
+
+    switch (spec?.values) {
+      case 'schema':
+        return Array.isArray(value)
+          ? value.some((v) => hasMalformedKeyword(v, depth + 1))
+          : malformedSubschema(value, depth);
+      case 'schemaList':
+        return !Array.isArray(value) || value.some((v) => hasMalformedKeyword(v, depth + 1));
+      case 'schemaMap':
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) return true;
+        return Object.values(value).some((v) => malformedSubschema(v, depth));
+      default:
+        return false;
+    }
   });
+}
+
+function malformedSubschema(value: unknown, depth: number): boolean {
+  if (typeof value === 'boolean') return false;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return true;
+  return hasMalformedKeyword(value, depth + 1);
 }
 
 /** Keywords whose presence means this level says something about object content. */
@@ -182,7 +220,15 @@ function deepEqual(a: any, b: any): boolean {
   return aKeys.length === bKeys.length && aKeys.every((k) => k in b && deepEqual(a[k], b[k]));
 }
 
-/** Strip annotations so that documentation-only edits compare equal. */
+/**
+ * Strip annotations so that documentation-only edits compare equal.
+ *
+ * The walk is position-aware: annotation keywords are only removed where a
+ * *schema* is expected. Inside a `properties` map the keys are user-chosen
+ * property names, so a property legitimately called `title` or `format` is data
+ * and must survive; recursing blindly deleted it and made two schemas that
+ * differ only in that property compare as identical.
+ */
 function stripAnnotations(schema: Schema): Schema {
   if (typeof schema === 'boolean') return schema;
   if (schema === null || typeof schema !== 'object') return schema;
@@ -191,9 +237,25 @@ function stripAnnotations(schema: Schema): Schema {
   const out: Record<string, any> = {};
   for (const [key, value] of Object.entries(schema)) {
     if (keywordKind(key) === 'annotation') continue;
-    out[key] = stripAnnotations(value);
+    out[key] = stripSubschemas(key, value);
   }
   return out;
+}
+
+/** Applies `stripAnnotations` only to the schema positions under `keyword`. */
+function stripSubschemas(keyword: string, value: any): any {
+  switch (KEYWORDS[keyword]?.values) {
+    case 'schema':
+      return stripAnnotations(value);
+    case 'schemaList':
+      return Array.isArray(value) ? value.map(stripAnnotations) : value;
+    case 'schemaMap':
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+      return Object.fromEntries(Object.entries(value).map(([name, sub]) => [name, stripAnnotations(sub)]));
+    default:
+      // Plain data (`const`, `enum`, `required`, `type`, ...) is left alone.
+      return value;
+  }
 }
 
 function isEmptySchema(schema: Schema): boolean {
@@ -222,15 +284,21 @@ function widenNumeric(types: Set<string>): Set<string> {
  * to `false` rather than keeping one side and pretending it is satisfiable.
  */
 function intersectTypes(a: any, b: any): any | null {
-  const setA = new Set(Array.isArray(a) ? a : [a]);
-  const setB = widenNumeric(new Set(Array.isArray(b) ? b : [b]));
-  const both = Array.from(widenNumeric(setA)).filter((t) => setB.has(t));
-  // Prefer the most specific surviving type (integer over number).
-  if (both.includes('integer') && both.includes('number')) {
-    return 'integer';
-  }
-  if (both.length === 0) return null;
-  return both.length === 1 ? both[0] : both;
+  const setA = new Set<string>(Array.isArray(a) ? a : [a]);
+  const setB = new Set<string>(Array.isArray(b) ? b : [b]);
+
+  // `integer` is a subset of `number`, so each side keeps a type the other
+  // admits. Widening *both* sides made `number` ∩ `number` yield
+  // `['number','integer']`, and the specificity rule below then collapsed it to
+  // `integer` - narrowing a type that neither side narrowed.
+  const both = [
+    ...Array.from(setA).filter((t) => setB.has(t) || (t === 'integer' && setB.has('number'))),
+    ...Array.from(setB).filter((t) => t === 'integer' && setA.has('number')),
+  ];
+  const unique = Array.from(new Set(both));
+
+  if (unique.length === 0) return null;
+  return unique.length === 1 ? unique[0] : unique;
 }
 
 /** The finite value set a schema pins down via `const` / `enum`, or null if unconstrained. */
@@ -402,6 +470,69 @@ class SchemaResolver {
   }
 }
 
+type Bound = { value: number; exclusive: boolean };
+type BoundAxis = { axis: string; isLower: boolean; keywords: Array<{ key: string; exclusive: boolean }> };
+
+/** The effective bound on one axis as `(value, exclusive)`, or null when unconstrained. */
+function readBound(schema: Schema, axis: BoundAxis): Bound | null {
+  const candidates: Bound[] = [];
+  for (const { key, exclusive } of axis.keywords) {
+    if (typeof schema?.[key] === 'number') candidates.push({ value: schema[key], exclusive });
+  }
+  if (candidates.length === 0) return null;
+
+  // Both forms present: the tighter one wins, matching `allOf` conjunction.
+  return candidates.reduce((strictest, candidate) =>
+    isAtLeastAsStrict(candidate, strictest, axis.isLower) ? candidate : strictest
+  );
+}
+
+function isAtLeastAsStrict(candidate: Bound, reference: Bound, isLower: boolean): boolean {
+  if (candidate.value === reference.value) {
+    // At the same value, excluding the endpoint is the stricter constraint.
+    return candidate.exclusive || !reference.exclusive;
+  }
+  return isLower ? candidate.value > reference.value : candidate.value < reference.value;
+}
+
+/**
+ * Describes a lower/upper bound pair that no value can satisfy once every
+ * subschema is composed, or null when the bounds are consistent.
+ *
+ * Shared with the OP#13 trait satisfiability check so that both use the same
+ * normalized `(value, exclusive)` comparison; comparing raw `minimum` against
+ * raw `maximum` misses `exclusiveMinimum: 10` against `maximum: 10`.
+ */
+export function findCrossedBound(subSchemas: Schema[]): string | null {
+  for (const [lowerIndex, upperIndex] of [
+    [0, 1],
+    [2, 3],
+    [4, 5],
+  ]) {
+    const lowerAxis = BOUND_AXES[lowerIndex];
+    const upperAxis = BOUND_AXES[upperIndex];
+    let lower: Bound | null = null;
+    let upper: Bound | null = null;
+
+    for (const sub of subSchemas) {
+      if (typeof sub !== 'object' || sub === null) continue;
+      const l = readBound(sub, lowerAxis);
+      if (l && (lower === null || isAtLeastAsStrict(l, lower, true))) lower = l;
+      const u = readBound(sub, upperAxis);
+      if (u && (upper === null || isAtLeastAsStrict(u, upper, false))) upper = u;
+    }
+
+    if (lower && upper) {
+      const crossed =
+        lower.value > upper.value || (lower.value === upper.value && (lower.exclusive || upper.exclusive));
+      if (crossed) {
+        return `${lowerAxis.axis} ${lower.exclusive ? '>' : '>='} ${lower.value} cannot hold together with ${upperAxis.axis} ${upper.exclusive ? '<' : '<='} ${upper.value}`;
+      }
+    }
+  }
+  return null;
+}
+
 class SubsumptionChecker {
   private resolver: SchemaResolver;
 
@@ -424,6 +555,10 @@ class SubsumptionChecker {
   subsumes(outerRaw: Schema, innerRaw: Schema, depth = 0): CompatVerdict {
     if (depth > MAX_SCHEMA_DEPTH) return 'unknown';
 
+    // Checked on the raw documents: `resolve()` drops `allOf` / `$ref`, so a
+    // malformed composition keyword would be invisible afterwards.
+    if (hasMalformedKeyword(outerRaw) || hasMalformedKeyword(innerRaw)) return 'unknown';
+
     const outer = this.resolver.resolve(outerRaw, depth);
     const inner = this.resolver.resolve(innerRaw, depth);
 
@@ -434,11 +569,6 @@ class SubsumptionChecker {
     const outerNorm = stripAnnotations(outer);
     const innerNorm = stripAnnotations(inner);
     if (deepEqual(outerNorm, innerNorm)) return this.finalize('compatible');
-
-    // A modeled keyword whose value has the wrong shape is not a constraint the
-    // engine can reason about. Treating it as absent would read as "no
-    // constraint" and pass, so the comparison is inconclusive instead.
-    if (hasMalformedKeyword(outerNorm) || hasMalformedKeyword(innerNorm)) return 'unknown';
 
     let verdict: CompatVerdict = 'compatible';
     verdict = worst(verdict, this.compareTypes(outerNorm, innerNorm));
@@ -476,44 +606,15 @@ class SubsumptionChecker {
     // `minimum: 0` and `exclusiveMinimum: 0` look like unrelated keywords even
     // though `x > 0` is a strict subset of `x >= 0`.
     for (const axis of BOUND_AXES) {
-      const outerBound = this.readBound(outer, axis);
+      const outerBound = readBound(outer, axis);
       if (outerBound === null) continue; // outer constrains nothing on this axis
-      const innerBound = this.readBound(inner, axis);
+      const innerBound = readBound(inner, axis);
       if (innerBound === null) return 'incompatible'; // inner is unbounded where outer is not
 
-      if (!this.isAtLeastAsStrict(innerBound, outerBound, axis.isLower)) return 'incompatible';
+      if (!isAtLeastAsStrict(innerBound, outerBound, axis.isLower)) return 'incompatible';
     }
 
     return 'compatible';
-  }
-
-  /** The effective bound on one axis as `(value, exclusive)`, or null when unconstrained. */
-  private readBound(
-    schema: Schema,
-    axis: { isLower: boolean; keywords: Array<{ key: string; exclusive: boolean }> }
-  ): { value: number; exclusive: boolean } | null {
-    const candidates: Array<{ value: number; exclusive: boolean }> = [];
-    for (const { key, exclusive } of axis.keywords) {
-      if (typeof schema[key] === 'number') candidates.push({ value: schema[key], exclusive });
-    }
-    if (candidates.length === 0) return null;
-
-    // Both forms present: the tighter one wins, matching `allOf` conjunction.
-    return candidates.reduce((strictest, candidate) =>
-      this.isAtLeastAsStrict(candidate, strictest, axis.isLower) ? candidate : strictest
-    );
-  }
-
-  private isAtLeastAsStrict(
-    candidate: { value: number; exclusive: boolean },
-    reference: { value: number; exclusive: boolean },
-    isLower: boolean
-  ): boolean {
-    if (candidate.value === reference.value) {
-      // At the same value, excluding the endpoint is the stricter constraint.
-      return candidate.exclusive || !reference.exclusive;
-    }
-    return isLower ? candidate.value > reference.value : candidate.value < reference.value;
   }
 
   private compareObjects(outer: Schema, inner: Schema, depth: number): CompatVerdict {

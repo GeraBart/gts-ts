@@ -409,6 +409,74 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     expect(gts.validateEntity(kidId).ok).toBe(false);
   });
 
+  test('exclusive and inclusive bounds that cross are detected', () => {
+    // `exclusiveMinimum: 10` and `maximum: 10` share no value; comparing raw
+    // minimum against raw maximum missed it.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.exclbound.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', required: ['n'], properties: { n: { exclusiveMinimum: 10 } } },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', required: ['n'], properties: { n: { maximum: 10 } } },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(false);
+  });
+
+  test('bounds that merely narrow are still satisfiable', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.okbound.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { n: { minimum: 0, maximum: 100 } } },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { n: { minimum: 10, maximum: 20 } } },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+
+  test('defaults nested under an object trait are materialized', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.nesteddefault.v1~';
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['routing'],
+          properties: {
+            routing: {
+              type: 'object',
+              required: ['topic'],
+              properties: { topic: { type: 'string', default: 'orders' } },
+            },
+          },
+        },
+        'x-gts-traits': { routing: {} },
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(true);
+  });
+
   test('a closed descendant trait-schema must not orphan an ancestor trait', () => {
     const gts = new GTS({ validateRefs: false });
     const baseId = 'gts.x.unit.tr.orphan.v1~';

@@ -23,7 +23,7 @@ Featureset:
 - [x] **OP#8.1 - Backward compatibility checking**
 - [x] **OP#8.2 - Forward compatibility checking**
 - [x] **OP#8.3 - Full compatibility checking**
-- [x] **OP#9 - Version Casting**: Transform instances between compatible MINOR versions
+- [x] **OP#9 - Version Casting**: Transform an instance to another version of its type. Reported separately from compatibility (§4.3, §4.6.3): a cast succeeds when its result satisfies the target type, not when the two schemas are compatible
 - [x] **OP#10 - Query Execution**: Filter identifier collections using the GTS query language
 - [x] **OP#11 - Attribute Access**: Retrieve property values and metadata using the attribute selector (`@`)
 - [x] **OP#12 - Type Derivation Validation**: Validate that a derived type correctly extends its base chain
@@ -69,7 +69,7 @@ const content = {
 
 const extracted = extractID(content);
 console.log(`ID: ${extracted.id}`);
-console.log(`Schema ID: ${extracted.schemaId}`);
+console.log(`Type ID: ${extracted.type_id}`);
 
 // OP#3 - ID Parsing
 const parsed = parseGtsID('gts.vendor.pkg.ns.type.v1~');

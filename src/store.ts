@@ -3,7 +3,7 @@ import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX, MAX_SCHEMA_DEP
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';
 import { XGtsRefValidator } from './x-gts-ref';
-import { GtsCompatibility } from './compatibility';
+import { GtsCompatibility, findCrossedBound } from './compatibility';
 import { GtsModifiers } from './modifiers';
 
 interface ResolvedSchema {
@@ -389,16 +389,35 @@ export class GtsStore {
     return (s.startsWith('http://') || s.startsWith('https://')) && s.includes('json-schema.org');
   }
 
-  private flattenSchema(schema: any): any {
+  private flattenSchema(schema: any, depth: number = 0): any {
     const result: any = {
       properties: {},
       required: [],
     };
 
+    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) return result;
+
+    // Follow a GTS reference. Derived types are `allOf: [{$ref: parent}, …]` by
+    // construction, so without this the parent's properties, `required` and
+    // defaults are invisible to everything built on the flattened view.
+    const ref = schema['$$ref'] || schema['$ref'];
+    if (typeof ref === 'string') {
+      const refId = ref.startsWith(GTS_URI_PREFIX) ? ref.substring(GTS_URI_PREFIX.length) : ref;
+      const refEntity = this.get(refId);
+      if (refEntity && refEntity.isSchema && refEntity.content) {
+        const resolved = this.flattenSchema(refEntity.content, depth + 1);
+        Object.assign(result.properties, resolved.properties || {});
+        result.required.push(...(resolved.required || []));
+        if (resolved.additionalProperties !== undefined) {
+          result.additionalProperties = resolved.additionalProperties;
+        }
+      }
+    }
+
     // Merge allOf schemas
     if (schema.allOf && Array.isArray(schema.allOf)) {
       for (const subSchema of schema.allOf) {
-        const flattened = this.flattenSchema(subSchema);
+        const flattened = this.flattenSchema(subSchema, depth + 1);
 
         // Merge properties
         Object.assign(result.properties, flattened.properties || {});
@@ -1078,7 +1097,7 @@ export class GtsStore {
       }
 
       const conflict =
-        this.findTypeConflict(subSchemas) || this.findValueConflict(subSchemas) || this.findBoundConflict(subSchemas);
+        this.findTypeConflict(subSchemas) || this.findValueConflict(subSchemas) || findCrossedBound(subSchemas);
       if (conflict) {
         return `trait '${propPath}' cannot be satisfied: ${conflict}`;
       }
@@ -1139,35 +1158,6 @@ export class GtsStore {
       allowed = allowed.filter((a) => values.some((b) => JSON.stringify(a) === JSON.stringify(b)));
       if (allowed.length === 0) {
         return `no value satisfies every declared const/enum (${seen.join(' vs ')})`;
-      }
-    }
-
-    return null;
-  }
-
-  /** Returns a description when the numeric bounds across subschemas cross over. */
-  private findBoundConflict(subSchemas: any[]): string | null {
-    const strictest = (key: string, pick: (a: number, b: number) => number): number | undefined => {
-      let value: number | undefined;
-      for (const subSchema of subSchemas) {
-        const candidate = typeof subSchema === 'object' && subSchema !== null ? subSchema[key] : undefined;
-        if (typeof candidate !== 'number') continue;
-        value = value === undefined ? candidate : pick(value, candidate);
-      }
-      return value;
-    };
-
-    const pairs: Array<[string, string]> = [
-      ['minimum', 'maximum'],
-      ['minLength', 'maxLength'],
-      ['minItems', 'maxItems'],
-    ];
-
-    for (const [minKey, maxKey] of pairs) {
-      const min = strictest(minKey, Math.max);
-      const max = strictest(maxKey, Math.min);
-      if (min !== undefined && max !== undefined && min > max) {
-        return `${minKey} ${min} exceeds ${maxKey} ${max} once the chain is composed`;
       }
     }
 
@@ -1345,17 +1335,52 @@ export class GtsStore {
   }
 
   // Apply defaults from trait schema to trait values
-  private applyTraitDefaults(schema: any, traits: Record<string, any>): Record<string, any> {
+  /**
+   * Materializes trait-schema `default`s into the effective traits object
+   * before the completeness check (§9.7.5, ADR-0003).
+   *
+   * Recursive: a default declared on a nested trait property is materialized
+   * too, provided its containing object is present or itself materialized.
+   * Applying only top-level defaults left `routing.topic` unresolved and the
+   * completeness check then failed on a trait the schema had already answered.
+   */
+  private applyTraitDefaults(schema: any, traits: Record<string, any>, depth: number = 0): Record<string, any> {
+    if (depth > MAX_SCHEMA_DEPTH) return traits;
+
     const result = { ...traits };
     const props = this.collectAllTraitProperties(schema);
 
     for (const [propName, propSchema] of Object.entries(props)) {
-      if (!(propName in result) && typeof propSchema === 'object' && propSchema !== null && 'default' in propSchema) {
-        result[propName] = propSchema.default;
+      if (typeof propSchema !== 'object' || propSchema === null) continue;
+
+      if (!(propName in result)) {
+        if ('default' in propSchema) {
+          result[propName] = propSchema.default;
+        } else if (this.hasNestedDefault(propSchema, depth)) {
+          // An object whose own subtree supplies every value it needs can be
+          // materialized from nothing.
+          const nested = this.applyTraitDefaults(propSchema, {}, depth + 1);
+          if (Object.keys(nested).length > 0) result[propName] = nested;
+        }
+        continue;
+      }
+
+      // Present already: fill in whatever the nested schema still defaults.
+      if (typeof result[propName] === 'object' && result[propName] !== null && !Array.isArray(result[propName])) {
+        result[propName] = this.applyTraitDefaults(propSchema, result[propName], depth + 1);
       }
     }
 
     return result;
+  }
+
+  /** True when a subschema declares a `default` anywhere in its own property tree. */
+  private hasNestedDefault(schema: any, depth: number): boolean {
+    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) return false;
+    return Object.values(this.collectAllTraitProperties(schema)).some(
+      (sub: any) =>
+        typeof sub === 'object' && sub !== null && ('default' in sub || this.hasNestedDefault(sub, depth + 1))
+    );
   }
 
   // Collect all properties from a trait schema (handling allOf composition)
@@ -1395,16 +1420,19 @@ export class GtsStore {
       }
       const refEntity = this.get(refId);
       if (refEntity && refEntity.content) {
-        visited.add(refId);
-        const inner = this.detectRefCycle(originId, refEntity.content, visited, depth + 1);
+        // Same rule as resolveTraitSchemaRefs: `visited` is the active
+        // recursion path, so following a ref extends a copy of it. Sharing one
+        // set across siblings reports ordinary reuse of a common schema as a
+        // cycle.
+        const inner = this.detectRefCycle(originId, refEntity.content, new Set(visited).add(refId), depth + 1);
         if (inner) return inner;
       }
     }
 
-    // Recurse into allOf
+    // Recurse into allOf - each branch is its own path.
     if (Array.isArray(content.allOf)) {
       for (const sub of content.allOf) {
-        const inner = this.detectRefCycle(originId, sub, visited, depth + 1);
+        const inner = this.detectRefCycle(originId, sub, new Set(visited), depth + 1);
         if (inner) return inner;
       }
     }

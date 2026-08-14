@@ -541,6 +541,75 @@ describe('OP#8 - the keyword table is the single source of truth', () => {
   });
 });
 
+describe('OP#8 - the walker distinguishes schema positions from data', () => {
+  test('a property whose name matches an annotation keyword is not stripped', () => {
+    // Inside `properties` the keys are user-chosen names. Treating `title` as
+    // the annotation keyword deleted the property and made the two schemas
+    // normalize to the same thing.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.datakw.t.v1.0~';
+    const newId = 'gts.x.unit.datakw.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'object', properties: { title: { type: 'string' } } });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'object', properties: { title: { type: 'number' } } });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('incompatible');
+  });
+
+  test('annotations are still stripped where a schema is expected', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.datakw.ann.v1.0~';
+    const newId = 'gts.x.unit.datakw.ann.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { a: { type: 'string', title: 'One' } },
+      additionalProperties: false,
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: { a: { type: 'string', title: 'Two' } },
+      additionalProperties: false,
+    });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('compatible');
+  });
+
+  test('restating the same type across allOf branches does not narrow it', () => {
+    // `number` intersected with `number` must stay `number`; widening both
+    // sides collapsed it to `integer`.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.restate.t.v1.0~';
+    const newId = 'gts.x.unit.restate.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, allOf: [{ type: 'number' }, { type: 'number' }] });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'number' });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('compatible');
+  });
+
+  test.each([
+    ['a non-array allOf', { type: 'object', allOf: { type: 'string' } }],
+    ['a non-string $$ref', { type: 'object', $$ref: 123 }],
+    ['a property schema that is not a schema', { type: 'object', properties: { name: 1 } }],
+  ])('%s makes the comparison inconclusive', (_label, body) => {
+    // These are dropped during resolution, so without an explicit check they
+    // read as "no constraint" and compare as compatible.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.badcomp.t.v1.0~';
+    const newId = 'gts.x.unit.badcomp.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, ...(body as Record<string, any>) });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'object' });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
+});
+
 describe('OP#8 - identifiers and reference resolution', () => {
   test('accepts gts:// URI form for either identifier', () => {
     const gts = new GTS({ validateRefs: false });

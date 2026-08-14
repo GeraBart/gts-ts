@@ -92,8 +92,9 @@ export class GTS {
    * OP#9 - cast an instance to another version of its type.
    *
    * Delegates to the registry implementation so that the library, the CLI and
-   * `POST /cast` all share one cast: it resolves `allOf` / `$ref` on the target
-   * before transforming, and validates the result against the target type.
+   * `POST /cast` all share one cast: it flattens the target through `allOf` and
+   * GTS `$ref`s before transforming, and validates the result against the
+   * target type.
    */
   castInstance(fromId: string, toTypeId: string): CastResult {
     const result = this.store.castInstance(fromId, toTypeId);

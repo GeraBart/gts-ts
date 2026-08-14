@@ -62,7 +62,9 @@ The previous boolean fields (`is_backward_compatible`, `is_forward_compatible`,
   `allOf: [{$ref: parent}, …]`, the library version silently dropped every property when
   casting to a derived type.
   `GTS.castInstance()`, the CLI and `POST /cast` now share the registry implementation.
-  The returned `CastResult` shape is unchanged.
+  The `CastResult` shape returned by the library and the CLI is unchanged; `POST /cast`
+  returns the registry response (`instance_id`, `to_type_id`, `casted_entity`), which is
+  what it returned before.
 - Casting no longer refuses when the two type schemas are not fully compatible. Casting is
   a separate operational contract that the spec requires to be reported separately from
   schema compatibility (§4.3, §4.6.3); under 0.13 almost no real schema evolution is
@@ -111,7 +113,8 @@ Several verdicts change for inputs that did not change:
 
 - Trait values merge by **JSON Merge Patch (RFC 7396)**: objects merge recursively, arrays
   replace wholesale, and `null` deletes a key.
-- Trait-schema `default`s are materialized before the completeness check.
+- Trait-schema `default`s are materialized before the completeness check, including defaults
+  declared on nested object properties.
 - **Completeness is keyed on `x-gts-abstract`**: non-abstract types must validate against the
   effective trait schema; abstract types are exempt.
 - Locking a trait value across descendants is now plain `const` in `x-gts-traits-schema`.
