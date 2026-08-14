@@ -382,6 +382,28 @@ describe('GTS Store Operations', () => {
     });
   });
 
+  describe('OP#12 - inheritance through a top-level $ref', () => {
+    test('a derived type that is exactly its parent via top-level $ref is valid', () => {
+      // ADR-0001 leaves the derivation body free; `{$ref: parent}` means
+      // "identical to the parent", which trivially satisfies derivation.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.tlbase.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a', 'b'],
+        properties: { a: { type: 'string' }, b: { type: 'string' } },
+        additionalProperties: false,
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.tlbase.v1~test.pkg._.kid.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        $$ref: 'gts://gts.test.pkg.ns.tlbase.v1~',
+      });
+
+      expect(gts.validateEntity('gts.test.pkg.ns.tlbase.v1~test.pkg._.kid.v1~').ok).toBe(true);
+    });
+  });
+
   describe('OP#9 - a cast succeeds only if its result fits the target', () => {
     beforeEach(() => {
       gts.register({

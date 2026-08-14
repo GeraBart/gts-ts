@@ -1348,57 +1348,75 @@ export class GtsStore {
     if (depth > MAX_SCHEMA_DEPTH) return traits;
 
     const result = { ...traits };
-    const props = this.collectAllTraitProperties(schema);
+    const { properties, required } = this.collectTraitSurface(schema);
 
-    for (const [propName, propSchema] of Object.entries(props)) {
+    for (const [propName, propSchema] of Object.entries(properties)) {
       if (typeof propSchema !== 'object' || propSchema === null) continue;
 
-      if (!(propName in result)) {
-        if ('default' in propSchema) {
-          result[propName] = propSchema.default;
-        } else if (this.hasNestedDefault(propSchema, depth)) {
-          // An object whose own subtree supplies every value it needs can be
-          // materialized from nothing.
-          const nested = this.applyTraitDefaults(propSchema, {}, depth + 1);
-          if (Object.keys(nested).length > 0) result[propName] = nested;
+      // Already carries a value: fill in whatever its own subtree defaults.
+      if (propName in result) {
+        const current = result[propName];
+        if (typeof current === 'object' && current !== null && !Array.isArray(current)) {
+          result[propName] = this.applyTraitDefaults(propSchema, current, depth + 1);
         }
         continue;
       }
 
-      // Present already: fill in whatever the nested schema still defaults.
-      if (typeof result[propName] === 'object' && result[propName] !== null && !Array.isArray(result[propName])) {
-        result[propName] = this.applyTraitDefaults(propSchema, result[propName], depth + 1);
+      if ('default' in propSchema) {
+        result[propName] = propSchema.default;
+        continue;
+      }
+
+      // No `default` of its own. ADR-0003 licenses materializing defaults, not
+      // inventing values, so an absent *optional* object stays absent -
+      // conjuring one would validate a subtree the author never supplied and
+      // could fail a type that is legitimately incomplete there. An absent
+      // *required* object is filled from its subtree; whatever the subtree
+      // cannot supply is then a genuine completeness failure.
+      if (required.has(propName)) {
+        const nested = this.applyTraitDefaults(propSchema, {}, depth + 1);
+        if (Object.keys(nested).length > 0) result[propName] = nested;
       }
     }
 
     return result;
   }
 
-  /** True when a subschema declares a `default` anywhere in its own property tree. */
-  private hasNestedDefault(schema: any, depth: number): boolean {
-    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) return false;
-    return Object.values(this.collectAllTraitProperties(schema)).some(
-      (sub: any) =>
-        typeof sub === 'object' && sub !== null && ('default' in sub || this.hasNestedDefault(sub, depth + 1))
-    );
-  }
-
-  // Collect all properties from a trait schema (handling allOf composition)
-  private collectAllTraitProperties(schema: any, depth: number = 0): Record<string, any> {
-    const props: Record<string, any> = {};
-    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) return props;
+  /**
+   * The declared surface of a trait schema at one level - its properties and
+   * which of them are required - with `allOf` branches merged in.
+   *
+   * Both are collected together so that a caller can never read a merged
+   * property list against a stale or differently-merged `required` list.
+   */
+  private collectTraitSurface(
+    schema: any,
+    depth: number = 0
+  ): { properties: Record<string, any>; required: Set<string> } {
+    const properties: Record<string, any> = {};
+    const required = new Set<string>();
+    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) {
+      return { properties, required };
+    }
 
     if (typeof schema.properties === 'object' && schema.properties !== null) {
-      Object.assign(props, schema.properties);
+      Object.assign(properties, schema.properties);
+    }
+    if (Array.isArray(schema.required)) {
+      for (const name of schema.required) {
+        if (typeof name === 'string') required.add(name);
+      }
     }
 
     if (Array.isArray(schema.allOf)) {
       for (const item of schema.allOf) {
-        Object.assign(props, this.collectAllTraitProperties(item, depth + 1));
+        const branch = this.collectTraitSurface(item, depth + 1);
+        Object.assign(properties, branch.properties);
+        for (const name of branch.required) required.add(name);
       }
     }
 
-    return props;
+    return { properties, required };
   }
 
   // Detect cyclic $$ref/$ref references reachable from a schema's content
@@ -1440,17 +1458,32 @@ export class GtsStore {
     return null;
   }
 
-  /** Every `$ref` / `$$ref` declared directly by an `allOf` branch of `schema`. */
-  private collectAllOfRefs(schema: any): string[] {
-    if (!schema || !Array.isArray(schema.allOf)) {
+  /**
+   * Every `$ref` / `$$ref` this schema declares directly - at the top level or
+   * in an `allOf` branch.
+   *
+   * The top level counts: `{"$ref": parent}` is a valid JSON Schema way to say
+   * "identical to the parent", and ADR-0001 leaves the derivation body free, so
+   * a derived type written that way inherits just as much as an `allOf` one.
+   */
+  private collectDirectRefs(schema: any): string[] {
+    if (!schema || typeof schema !== 'object') {
       return [];
     }
+
     const refs: string[] = [];
-    for (const sub of schema.allOf) {
-      if (sub && typeof sub === 'object') {
-        const ref = sub['$$ref'] || sub['$ref'];
-        if (typeof ref === 'string') {
-          refs.push(ref);
+    const own = schema['$$ref'] || schema['$ref'];
+    if (typeof own === 'string') {
+      refs.push(own);
+    }
+
+    if (Array.isArray(schema.allOf)) {
+      for (const sub of schema.allOf) {
+        if (sub && typeof sub === 'object') {
+          const ref = sub['$$ref'] || sub['$ref'];
+          if (typeof ref === 'string') {
+            refs.push(ref);
+          }
         }
       }
     }
@@ -1466,7 +1499,7 @@ export class GtsStore {
    * restate them (ADR-0001 variant 2c).
    */
   private inheritsParentViaRef(schema: any, parentId: string): boolean {
-    return this.collectAllOfRefs(schema).some((ref) => {
+    return this.collectDirectRefs(schema).some((ref) => {
       const normalized = ref.startsWith(GTS_URI_PREFIX) ? ref.substring(GTS_URI_PREFIX.length) : ref;
       return normalized === parentId;
     });
@@ -1479,6 +1512,28 @@ export class GtsStore {
       additionalProperties: undefined,
       type: schema.type,
     };
+
+    // A top-level `$ref` carries the whole referenced schema, exactly as an
+    // `allOf` branch does; without this a parent written that way resolves to
+    // nothing and its constraints become unenforceable for descendants.
+    const ownRef = schema['$$ref'] || schema['$ref'];
+    if (typeof ownRef === 'string') {
+      const refId = ownRef.startsWith(GTS_URI_PREFIX) ? ownRef.substring(GTS_URI_PREFIX.length) : ownRef;
+      if (!visited.has(refId)) {
+        const refEntity = this.get(refId);
+        if (refEntity && refEntity.content) {
+          const resolved = this.resolveSchemaFully(refEntity.content, new Set(visited).add(refId));
+          Object.assign(result.properties, resolved.properties);
+          result.required.push(...(resolved.required || []));
+          if (resolved.additionalProperties !== undefined) {
+            result.additionalProperties = resolved.additionalProperties;
+          }
+          if (resolved.type && !result.type) {
+            result.type = resolved.type;
+          }
+        }
+      }
+    }
 
     // If this schema has allOf, resolve each part
     if (schema.allOf && Array.isArray(schema.allOf)) {

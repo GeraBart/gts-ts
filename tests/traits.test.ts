@@ -477,6 +477,80 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     expect(gts.validateEntity(baseId).ok).toBe(true);
   });
 
+  test('an optional trait object with a partly-defaulted subtree stays absent', () => {
+    // ADR-0003 licenses materializing declared defaults, not inventing values.
+    // Conjuring an absent *optional* object validates a subtree the author never
+    // supplied, which rejected a type that is legitimately silent there.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.optsubtree.v1~';
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            routing: {
+              type: 'object',
+              required: ['topic', 'partitionKey'],
+              properties: { topic: { type: 'string', default: 'orders' }, partitionKey: { type: 'string' } },
+            },
+          },
+        },
+        'x-gts-traits': {},
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(true);
+  });
+
+  test('a required trait object is materialized from its subtree defaults', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.reqsubtree.v1~';
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['routing'],
+          properties: {
+            routing: {
+              type: 'object',
+              required: ['topic'],
+              properties: { topic: { type: 'string', default: 'orders' } },
+            },
+          },
+        },
+        'x-gts-traits': {},
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(true);
+  });
+
+  test('a required trait object whose subtree cannot be completed still fails', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.reqgap.v1~';
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['routing'],
+          properties: {
+            routing: {
+              type: 'object',
+              required: ['topic', 'key'],
+              properties: { topic: { type: 'string', default: 'orders' }, key: { type: 'string' } },
+            },
+          },
+        },
+        'x-gts-traits': {},
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(false);
+  });
+
   test('a closed descendant trait-schema must not orphan an ancestor trait', () => {
     const gts = new GTS({ validateRefs: false });
     const baseId = 'gts.x.unit.tr.orphan.v1~';
