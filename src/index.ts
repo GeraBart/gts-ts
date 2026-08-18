@@ -25,6 +25,7 @@ import {
   CompatibilityResult,
   CastResult,
   GtsConfig,
+  EntityLookup,
 } from './types';
 
 export const isValidGtsID = (id: string): boolean => Gts.isValidGtsID(id);
@@ -105,6 +106,58 @@ export class GTS {
       result: result.casted_entity ?? undefined,
       error: result.error || undefined,
     };
+  }
+
+  /**
+   * The raw registry cast result (every field the store computes - added /
+   * removed properties, per-direction compatibility, etc.), for callers that
+   * need the full response shape rather than the narrower `CastResult` that
+   * `castInstance()` above returns.
+   */
+  castInstanceRaw(fromId: string, toTypeId: string): any {
+    return this.store.castInstance(fromId, toTypeId);
+  }
+
+  /**
+   * The document-level GTS rules for a type schema (§9.7.1, §9.11). Delegates
+   * to the registry implementation so that `register()`, `validateEntity()`
+   * and the HTTP server all share the same check instead of the server
+   * reaching past `GtsStore`'s encapsulation to call it directly.
+   */
+  checkTypeSchemaRules(content: any, id: string | undefined, options: { enforceGuards: boolean }): string | null {
+    return this.store.checkTypeSchemaRules(content, id, options);
+  }
+
+  /**
+   * The document-level GTS rule for an instance: its rightmost type must be
+   * instantiable (§9.11.3 item 1).
+   */
+  checkInstanceRules(typeId: string | null | undefined): string | null {
+    return this.store.checkInstanceRules(typeId);
+  }
+
+  /** Resolves a single attribute path on an entity, given as two separate arguments. */
+  getAttributeAt(gtsId: string, path: string): AttributeResult {
+    return this.store.getAttribute(gtsId, path);
+  }
+
+  /**
+   * A minimal, read-only view of the registry for collaborators (e.g.
+   * `XGtsRefValidator`) that only need to resolve an id to an entity, so they
+   * do not have to depend on `GtsStore` - or reach past this class's private
+   * field to get one - just to look entities up.
+   */
+  asEntityLookup(): EntityLookup {
+    return this.store;
+  }
+
+  /**
+   * Derivation and trait completeness are both type-level properties (§9.7.5).
+   * Exposed directly because `validateEntity()` below applies it only after
+   * first resolving `id` to an entity.
+   */
+  validateSchemaAgainstParent(schemaId: string): ValidationResult {
+    return this.store.validateSchemaAgainstParent(schemaId);
   }
 
   validateEntity(id: string): ValidationResult & { entity_type: string } {

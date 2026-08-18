@@ -82,6 +82,54 @@ describe('GTS Type Schema Modifiers (spec §9.11)', () => {
       expect(found).toHaveLength(2);
     });
 
+    test('rejects a keyword nested under contains', () => {
+      const found = GtsModifiers.findMisplacedKeywords({
+        type: 'array',
+        contains: { 'x-gts-final': true },
+      });
+      expect(found).toEqual(['contains/x-gts-final']);
+    });
+
+    test('rejects a keyword nested under propertyNames', () => {
+      const found = GtsModifiers.findMisplacedKeywords({
+        type: 'object',
+        propertyNames: { 'x-gts-final': true },
+      });
+      expect(found).toEqual(['propertyNames/x-gts-final']);
+    });
+
+    test('rejects a keyword nested under additionalItems', () => {
+      const found = GtsModifiers.findMisplacedKeywords({
+        type: 'array',
+        additionalItems: { 'x-gts-final': true },
+      });
+      expect(found).toEqual(['additionalItems/x-gts-final']);
+    });
+
+    test('rejects a keyword nested in a dependencies entry using the schema-dependency form', () => {
+      const found = GtsModifiers.findMisplacedKeywords({
+        type: 'object',
+        dependencies: { n: { 'x-gts-final': true } },
+      });
+      expect(found).toEqual(['dependencies/n/x-gts-final']);
+    });
+
+    test('does not scan a dependencies entry using the property-dependency (array) form', () => {
+      const found = GtsModifiers.findMisplacedKeywords({
+        type: 'object',
+        dependencies: { n: ['a', 'b'] },
+      });
+      expect(found).toEqual([]);
+    });
+
+    test('rejects a keyword nested in a dependentSchemas entry', () => {
+      const found = GtsModifiers.findMisplacedKeywords({
+        type: 'object',
+        dependentSchemas: { creditCard: { 'x-gts-final': true } },
+      });
+      expect(found).toEqual(['dependentSchemas/creditCard/x-gts-final']);
+    });
+
     test('fails closed when a document is nested too deeply to scan', () => {
       // The recursion guard must not let a subtree through unchecked: a
       // keyword hidden below the limit would otherwise be silently accepted.
@@ -103,6 +151,34 @@ describe('GTS Type Schema Modifiers (spec §9.11)', () => {
           type: 'object',
           'x-gts-traits': { 'x-gts-final': 'just a string value' },
           'x-gts-traits-schema': { type: 'object', properties: { 'x-gts-abstract': { type: 'boolean' } } },
+        })
+      ).toEqual([]);
+    });
+
+    test('does not flag a property literally named like a document-level keyword', () => {
+      // `x-gts-abstract` here is a *property name* chosen by the schema
+      // author, not an occurrence of the keyword - it sits in a data position
+      // (a `properties` map key), not a schema position.
+      expect(
+        GtsModifiers.findMisplacedKeywords({
+          type: 'object',
+          properties: { 'x-gts-abstract': { type: 'string' } },
+        })
+      ).toEqual([]);
+    });
+
+    test('does not flag a property named like a keyword nested in a definitions/$defs map', () => {
+      expect(
+        GtsModifiers.findMisplacedKeywords({
+          type: 'object',
+          definitions: { Sub: { type: 'object', properties: { 'x-gts-final': { type: 'boolean' } } } },
+        })
+      ).toEqual([]);
+
+      expect(
+        GtsModifiers.findMisplacedKeywords({
+          type: 'object',
+          $defs: { Sub: { type: 'object', properties: { 'x-gts-traits': { type: 'string' } } } },
         })
       ).toEqual([]);
     });
@@ -209,10 +285,15 @@ describe('x-gts-final / x-gts-abstract enforcement through the registry', () => 
     expect(result.error).toMatch(/top level/);
   });
 
-  test('a malformed modifier declaration fails validation', () => {
+  test('a malformed modifier declaration is rejected synchronously at registration, not only at validateEntity', () => {
+    // §9.11.1 unqualifiedly requires registration itself to reject this - the
+    // CLI's only ingestion path is `register()`, which never called
+    // `validateEntity()`, so this must fail here rather than needing a
+    // separate validation step to be caught.
     const gts = new GTS({ validateRefs: false });
-    gts.register(base('gts.x.unit.fa.bad.v1~', { 'x-gts-final': true, 'x-gts-abstract': true }));
 
-    expect(gts.validateEntity('gts.x.unit.fa.bad.v1~').ok).toBe(false);
+    expect(() => gts.register(base('gts.x.unit.fa.bad2.v1~', { 'x-gts-final': true, 'x-gts-abstract': true }))).toThrow(
+      /must not declare both/
+    );
   });
 });

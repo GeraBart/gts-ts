@@ -130,6 +130,21 @@ const KEYWORDS: Record<string, KeywordSpec> = {
   'x-gts-ref': { kind: 'unmodeled' },
 };
 
+/**
+ * Where subschemas live under each keyword, derived from `KEYWORDS` so this
+ * remains the single source of truth for the position-aware walk instead of
+ * a second, divergence-prone copy. Consumed here by `stripSubschemas()` /
+ * `hasMalformedKeyword()`, and by `GtsModifiers.scanSubschemas()` (see
+ * `modifiers.ts`), which needs the same schema/schemaMap/schemaList
+ * classification for its own position-aware walk but has no other reason to
+ * depend on the rest of this module's keyword handling.
+ */
+export const SCHEMA_KEYWORD_POSITIONS: Record<string, 'schema' | 'schemaMap' | 'schemaList'> = Object.fromEntries(
+  Object.entries(KEYWORDS)
+    .filter(([, spec]) => spec.values !== undefined)
+    .map(([key, spec]) => [key, spec.values as 'schema' | 'schemaMap' | 'schemaList'])
+);
+
 function keywordKind(key: string): KeywordKind {
   const spec = KEYWORDS[key];
   if (spec) return spec.kind;
@@ -310,13 +325,23 @@ function fixedValues(schema: Schema): any[] | null {
 
 type ContentModel = 'open' | 'closed' | 'partial';
 
+/** Whether a keyword value is a schema (not `undefined`/`true`/an effectively-empty schema). */
+function isRestrictiveSchema(value: Schema | undefined): boolean {
+  return value !== undefined && value !== true && !isEmptySchema(value);
+}
+
 function contentModel(schema: Schema): ContentModel {
   if (typeof schema !== 'object' || schema === null) return 'open';
   const ap = schema.additionalProperties;
   const up = schema.unevaluatedProperties;
   if (ap === false || up === false) return 'closed';
-  if (ap === undefined || ap === true || isEmptySchema(ap)) return 'open';
-  return 'partial';
+  // `additionalProperties: true` evaluates every property `properties` /
+  // `patternProperties` did not already evaluate, so `unevaluatedProperties`
+  // never applies to anything - the level is fully open regardless of what
+  // `unevaluatedProperties` says (2019-09+ `unevaluatedProperties` semantics).
+  if (ap === true) return 'open';
+  if (isRestrictiveSchema(ap) || isRestrictiveSchema(up)) return 'partial';
+  return 'open';
 }
 
 /**
@@ -327,7 +352,12 @@ function undeclaredSchema(schema: Schema): Schema | null {
   const model = contentModel(schema);
   if (model === 'closed') return null;
   if (model === 'open') return ANY_SCHEMA;
-  return schema.additionalProperties;
+  const ap = schema.additionalProperties;
+  const up = schema.unevaluatedProperties;
+  const apRestrictive = isRestrictiveSchema(ap);
+  const upRestrictive = isRestrictiveSchema(up);
+  if (apRestrictive && upRestrictive) return mergeSchemas(ap, up);
+  return apRestrictive ? ap : up;
 }
 
 /** Conjunction of two schemas, used to flatten `allOf` and `$ref` into one effective schema. */

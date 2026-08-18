@@ -119,6 +119,18 @@ const ROWS: Row[] = [
     full: 'incompatible',
   },
   {
+    change: 'widening a schema-valued unevaluatedProperties to fully open',
+    old: {
+      required: ['a'],
+      properties: { a: { type: 'string' } },
+      unevaluatedProperties: { type: 'string' },
+    },
+    new: { required: ['a'], properties: { a: { type: 'string' } }, ...OPEN },
+    backward: 'compatible',
+    forward: 'incompatible',
+    full: 'incompatible',
+  },
+  {
     change: 'changing required property to optional',
     old: { required: ['a', 'b'], properties: { a: { type: 'string' }, b: { type: 'string' } }, ...CLOSED },
     new: { required: ['a'], properties: { a: { type: 'string' }, b: { type: 'string' } }, ...CLOSED },
@@ -526,6 +538,30 @@ describe('OP#8 - the keyword table is the single source of truth', () => {
 
     const result = gts.checkCompatibility(oldId, newId);
     expect(result.backward_compatibility).toBe('incompatible');
+    expect(result.forward_compatibility).toBe('compatible');
+  });
+
+  test('additionalProperties: true makes the level open even alongside a schema-valued unevaluatedProperties', () => {
+    // unevaluatedProperties only applies to properties that properties /
+    // patternProperties / additionalProperties did not already evaluate.
+    // additionalProperties: true evaluates every remaining property, so
+    // unevaluatedProperties can never actually apply here - the level is
+    // fully open, not partially restricted by unevaluatedProperties's schema.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.apalwaysopen.t.v1.0~';
+    const newId = 'gts.x.unit.apalwaysopen.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'object', properties: {} });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      properties: {},
+      additionalProperties: true,
+      unevaluatedProperties: { type: 'number' },
+    });
+
+    const result = gts.checkCompatibility(oldId, newId);
     expect(result.forward_compatibility).toBe('compatible');
   });
 

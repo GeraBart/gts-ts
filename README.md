@@ -17,7 +17,7 @@ Featureset:
 - [x] **OP#3 - ID Parsing**: Decompose identifiers into constituent parts (vendor, package, namespace, type, version, etc.)
 - [x] **OP#4 - ID Pattern Matching**: Match identifiers against patterns containing wildcards
 - [x] **OP#5 - ID to UUID Mapping**: Generate deterministic UUIDs from GTS identifiers
-- [x] **OP#6 - Instance Validation**: Validate object instances against their corresponding schemas
+- [x] **OP#6 - Instance Validation**: Validate object instances against their corresponding Type Schemas
 - [x] **OP#7 - Relationship Resolution**: Load all schemas and instances, resolve inter-dependencies, and detect broken references
 - [x] **OP#8 - Type Schema Evolution Compatibility Checking**: Compare two definitions of one type identity and report the tri-state verdict (`compatible` / `incompatible` / `unknown`) for each relation
 - [x] **OP#8.1 - Backward compatibility checking**

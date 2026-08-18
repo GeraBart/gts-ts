@@ -15,14 +15,14 @@ changes to both the HTTP API and the library API.
 
 ### Breaking - HTTP API
 
-| Before | After |
-| --- | --- |
-| `POST /schemas` with the schema as the body | `POST /type-schemas` with `{ "type_id", "type_schema" }` |
-| `POST /validate-schema` with `{ "schema_id" }` | `POST /validate-type-schema` with `{ "type_id" }` |
-| `GET /compatibility?old_schema_id=&new_schema_id=` | `GET /compatibility?old_type_id=&new_type_id=` |
-| `POST /cast` with `{ "instance_id", "to_schema_id" }` | `POST /cast` with `{ "instance_id", "to_type_id" }` |
+| Before                                                                      | After                                                         |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `POST /schemas` with the schema as the body                                 | `POST /type-schemas` with `{ "type_id", "type_schema" }`      |
+| `POST /validate-schema` with `{ "schema_id" }`                              | `POST /validate-type-schema` with `{ "type_id" }`             |
+| `GET /compatibility?old_schema_id=&new_schema_id=`                          | `GET /compatibility?old_type_id=&new_type_id=`                |
+| `POST /cast` with `{ "instance_id", "to_schema_id" }`                       | `POST /cast` with `{ "instance_id", "to_type_id" }`           |
 | `/extract-id` returned `schema_id`, `selected_schema_id_field`, `is_schema` | returns `type_id`, `selected_type_id_field`, `is_type_schema` |
-| `/parse-id` returned `is_schema` | returns `is_type_schema`, plus a new `is_type` field |
+| `/parse-id` returned `is_schema`                                            | returns `is_type_schema`, plus a new `is_type` field          |
 
 `GET /compatibility` now returns the tri-state verdicts required by §4.3:
 
@@ -30,9 +30,9 @@ changes to both the HTTP API and the library API.
 {
   "old": "gts.x.core.events.type.v1.0~",
   "new": "gts.x.core.events.type.v1.1~",
-  "backward_compatibility": "compatible",   // compatible | incompatible | unknown
+  "backward_compatibility": "compatible", // compatible | incompatible | unknown
   "forward_compatibility": "incompatible",
-  "full_compatibility": "incompatible"
+  "full_compatibility": "incompatible",
 }
 ```
 
@@ -58,7 +58,7 @@ The previous boolean fields (`is_backward_compatible`, `is_forward_compatible`,
   existing consumers keep parsing, but they carry no information and will be removed.
 - **`GtsCast` was removed.** There were two cast implementations - one in the library, one
   in the registry. Only the registry implementation resolved `allOf` / `$ref` on the target
-  and validated the cast result; the library one did neither. Since GTS derived types *are*
+  and validated the cast result; the library one did neither. Since GTS derived types _are_
   `allOf: [{$ref: parent}, …]`, the library version silently dropped every property when
   casting to a derived type.
   `GTS.castInstance()`, the CLI and `POST /cast` now share the registry implementation.
@@ -68,7 +68,7 @@ The previous boolean fields (`is_backward_compatible`, `is_forward_compatible`,
 - Casting no longer refuses when the two type schemas are not fully compatible. Casting is
   a separate operational contract that the spec requires to be reported separately from
   schema compatibility (§4.3, §4.6.3); under 0.13 almost no real schema evolution is
-  *fully* compatible, so the old gate rejected ordinary casts. A cast now succeeds only if
+  _fully_ compatible, so the old gate rejected ordinary casts. A cast now succeeds only if
   its **result** satisfies the target type, including that type's `x-gts-ref` constraints.
 - The `direction` field reported `upgrade` / `downgrade` / `same` on `GET /compatibility`
   but `up` / `down` / `none` on `POST /cast`, from two separate implementations. Both now
@@ -78,6 +78,21 @@ The previous boolean fields (`is_backward_compatible`, `is_forward_compatible`,
   `type: "object"`, and it may contain a nested `x-gts-traits` member. Per ADR-0002 the
   keyword is an ordinary JSON Schema subschema (object, `true` or `false`), so neither
   restriction has a basis in 0.13; the placement rule deliberately does not scan inside it.
+- The `mode` parameter on `GTS.checkCompatibility()` / `GtsCompatibility.checkCompatibility()` /
+  `GET /compatibility?mode=` / the CLI's `-m` flag no longer narrows what gets computed
+  (spec §9.2, §4.3 require always computing all three verdicts). It is retained only for
+  call-site and display compatibility; the result always contains
+  `backward_compatibility`, `forward_compatibility` and `full_compatibility`.
+- `GtsStore.register()` now throws synchronously when a schema's `x-gts-final` /
+  `x-gts-abstract` declaration is malformed (§9.11.1: a non-boolean value, or both keywords
+  declared `true` on the same schema) instead of registering it uninspected. This changes
+  the CLI's directory-load path: `loadEntitiesFromDir` (used by `gts load` and every command
+  that loads a directory of entities) already caught the per-entity `register()` call and
+  only reports the failure via `console.warn` when `--verbose` is passed - the same pattern
+  it uses for an unreadable file or an unparsable JSON document in that function. Without
+  `--verbose`, a directory containing a malformed schema now loads with **fewer entities
+  registered than files present, and no error**; pass `--verbose` to see which entities were
+  skipped and why.
 
 ### Changed - compatibility semantics (spec 0.13 §4)
 

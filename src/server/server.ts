@@ -55,6 +55,14 @@ export class GtsServer {
     this.registerRoutes();
   }
 
+  /**
+   * The underlying Fastify instance, exposed read-only so tests can exercise
+   * routes via `.inject()` without opening a real network listener.
+   */
+  public get instance(): FastifyInstance {
+    return this.fastify;
+  }
+
   private setupMiddleware(): void {
     // Enable CORS manually
     this.fastify.addHook('onRequest', async (_request, reply) => {
@@ -179,9 +187,9 @@ export class GtsServer {
       // document cannot be interpreted, so there is nothing to register.
       // The guards beyond that are gated on `validate` per §9.11.5.
       const ruleError = entity.isSchema
-        ? this.store['store'].checkTypeSchemaRules(content, entity.id, { enforceGuards: validate })
+        ? this.store.checkTypeSchemaRules(content, entity.id, { enforceGuards: validate })
         : validate
-          ? this.store['store'].checkInstanceRules(entity.schemaId)
+          ? this.store.checkInstanceRules(entity.schemaId)
           : null;
       if (ruleError) {
         reply.code(422);
@@ -225,7 +233,7 @@ export class GtsServer {
       // Validate schema with x-gts-ref if it's a schema
       // x-gts-ref validation always returns 422 on failure (not just when validate=true)
       if (entity.isSchema) {
-        const xGtsRefValidator = new XGtsRefValidator(this.store['store']);
+        const xGtsRefValidator = new XGtsRefValidator(this.store.asEntityLookup());
         const xGtsRefErrors = xGtsRefValidator.validateSchema(content);
         if (xGtsRefErrors.length > 0) {
           const errorMsgs = xGtsRefErrors.map((err) => `${err.fieldPath}: ${err.reason}`).join('; ');
@@ -384,7 +392,7 @@ export class GtsServer {
           // The bulk endpoint has no `validate` switch, so it applies the same
           // always-on rules as POST /entities and none of the gated guards.
           const declarationError = entity.isSchema
-            ? this.store['store'].checkTypeSchemaRules(content, entity.id, { enforceGuards: false })
+            ? this.store.checkTypeSchemaRules(content, entity.id, { enforceGuards: false })
             : null;
           if (declarationError) {
             errors.push(declarationError);
@@ -425,6 +433,15 @@ export class GtsServer {
     if (!type_id || !type_schema || typeof type_schema !== 'object') {
       reply.code(422);
       return { ok: false, error: 'Missing required fields: type_id, type_schema' };
+    }
+
+    // §2.1 / §11.1 Rule C.1 - a GTS Type Identifier MUST end with `~`.
+    if (!gts.isValidGtsID(type_id) || !type_id.endsWith('~')) {
+      reply.code(422);
+      return {
+        ok: false,
+        error: `Invalid type_id: must be a well-formed GTS Type Identifier ending with '~', got '${type_id}'`,
+      };
     }
 
     // The explicit type_id wins over any identifier carried inside the body, so
@@ -591,7 +608,7 @@ export class GtsServer {
     }
 
     // Call the store's castInstance directly to get the correct response format
-    return this.store['store'].castInstance(instance_id, to_type_id);
+    return this.store.castInstanceRaw(instance_id, to_type_id);
   }
 
   // OP#10 - Query
@@ -651,7 +668,7 @@ export class GtsServer {
       throw new Error('Missing required parameters: gts_with_path or (gts_id, path)');
     }
 
-    return this.store['store'].getAttribute(gtsId, path);
+    return this.store.getAttributeAt(gtsId, path);
   }
 
   // OP#12 - Validate Type Schema
@@ -663,7 +680,7 @@ export class GtsServer {
     if (!type_id) {
       return { ok: false, error: 'Missing required field: type_id' };
     }
-    return this.store['store'].validateSchemaAgainstParent(type_id);
+    return this.store.validateSchemaAgainstParent(type_id);
   }
 
   // OP#12 - Validate Entity (unified)

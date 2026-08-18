@@ -54,6 +54,20 @@ export class GtsStore {
         }
       }
     }
+
+    // A malformed modifier declaration (mutually-exclusive x-gts-final +
+    // x-gts-abstract, or a non-boolean value) "MUST be rejected during schema
+    // registration" (§9.11.1) unconditionally - unlike the placement/guard
+    // checks in `checkTypeSchemaRules`'s `enforceGuards` branch, this part
+    // does not depend on `validateEntity`/HTTP-only enforcement, so it has to
+    // run here to cover every entry point (library, CLI, HTTP).
+    if (entity.isSchema && entity.content) {
+      const declarationError = this.checkTypeSchemaRules(entity.content, entity.id, { enforceGuards: false });
+      if (declarationError) {
+        throw new Error(declarationError);
+      }
+    }
+
     this.byId.set(entity.id, entity);
 
     // If this is a schema, add it to AJV for reference resolution
@@ -522,6 +536,18 @@ export class GtsStore {
       const instanceContent = instanceEntity.content;
       const fromSchemaContent = fromSchema.content;
       const toSchemaContent = toSchema.content;
+
+      // A cast that lands on an abstract type would produce an instance the
+      // registry could never accept directly (§9.11.3), so reject it here
+      // too rather than only at direct instantiation/validation time.
+      if (GtsModifiers.isAbstract(toSchemaContent)) {
+        return {
+          instance_id: instanceId,
+          to_type_id: toSchemaId,
+          ok: false,
+          error: `Cannot cast to abstract type: ${toSchemaId}`,
+        };
+      }
 
       // Perform the cast
       return this.performCast(

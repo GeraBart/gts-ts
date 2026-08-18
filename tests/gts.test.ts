@@ -464,6 +464,36 @@ describe('GTS Store Operations', () => {
     });
   });
 
+  describe('OP#9 - casting never lands on an abstract type', () => {
+    test('rejects a cast whose target is x-gts-abstract, mirroring direct instantiation', () => {
+      const store = new GtsStore({ validateRefs: false });
+      store.register(
+        createJsonEntity({
+          $$id: 'gts.test.pkg.ns.castabs.v1~',
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      );
+      store.register(
+        createJsonEntity({
+          $$id: 'gts.test.pkg.ns.castabs.v2~',
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+          'x-gts-abstract': true,
+        })
+      );
+      store.register(createJsonEntity({ id: 'gts.test.pkg.ns.castabs.v1~test.pkg._.item.v1' }));
+
+      const result: Record<string, any> = store.castInstance(
+        'gts.test.pkg.ns.castabs.v1~test.pkg._.item.v1',
+        'gts.test.pkg.ns.castabs.v2~'
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/abstract/i);
+    });
+  });
+
   describe('OP#9 - Version Casting', () => {
     test('casts instance between compatible versions', () => {
       const schemaV1 = {

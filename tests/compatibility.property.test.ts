@@ -1,4 +1,5 @@
 import Ajv from 'ajv';
+import Ajv2019 from 'ajv/dist/2019';
 import { GTS } from '../src';
 
 const DRAFT7 = 'http://json-schema.org/draft-07/schema#';
@@ -77,13 +78,14 @@ function buildCandidates(): Candidate[] {
   // content model of the object around it.
   for (const [leafName, leaf] of LEAVES) {
     for (const required of [false, true]) {
-      for (const [apName, ap] of [
-        ['open', undefined],
-        ['closed', false],
-      ] as Array<[string, unknown]>) {
+      for (const [apName, apKey, ap] of [
+        ['open', 'additionalProperties', undefined],
+        ['closed', 'additionalProperties', false],
+        ['up-string', 'unevaluatedProperties', { type: 'string' }],
+      ] as Array<[string, string, unknown]>) {
         const body: Record<string, any> = { type: 'object', properties: { p: leaf } };
         if (required) body.required = ['p'];
-        if (ap !== undefined) body.additionalProperties = ap;
+        if (ap !== undefined) body[apKey] = ap;
         candidates.push({ label: `p:${leafName}/${required ? 'req' : 'opt'}/${apName}`, body });
       }
     }
@@ -184,8 +186,16 @@ describe('OP#8 - subsumption soundness against a real JSON Schema validator', ()
 
   beforeAll(() => {
     const ajv = new Ajv({ strict: false, validateSchema: false, allErrors: false });
+    // Draft-07 (the `ajv` default dialect) has no `unevaluatedProperties`
+    // keyword at all, so candidates that use it need a 2019-09 instance -
+    // otherwise the oracle would silently ignore the keyword and the
+    // comparison would prove nothing about it either way.
+    const ajv2019 = new Ajv2019({ strict: false, validateSchema: false, allErrors: false });
     accepts = candidates.map((candidate) => {
-      const validate = ajv.compile({ $schema: DRAFT7, ...candidate.body });
+      const usesUnevaluated = 'unevaluatedProperties' in candidate.body;
+      const validate = usesUnevaluated
+        ? ajv2019.compile(candidate.body)
+        : ajv.compile({ $schema: DRAFT7, ...candidate.body });
       return INSTANCES.map((instance) => validate(instance) as boolean);
     });
 

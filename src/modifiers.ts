@@ -11,6 +11,7 @@
  */
 
 import { MAX_SCHEMA_DEPTH } from './types';
+import { SCHEMA_KEYWORD_POSITIONS } from './compatibility';
 
 export const X_GTS_FINAL = 'x-gts-final';
 export const X_GTS_ABSTRACT = 'x-gts-abstract';
@@ -77,11 +78,18 @@ export class GtsModifiers {
       // The top-level occurrences are the correct placement. Their values are
       // trait data or a trait subschema, never a place for further keywords.
       if (DOCUMENT_LEVEL_KEYWORDS.includes(key)) continue;
-      this.scan(value, key, found, 0);
+      this.scanSubschemas(key, value, key, found, 0);
     }
     return found;
   }
 
+  /**
+   * Scans a *schema position* (never a data position) for misplaced keywords.
+   * Position-aware for the same reason `compatibility.ts`'s `stripAnnotations`
+   * walk is: `{ properties: { 'x-gts-abstract': {...} } }` names a property
+   * called `x-gts-abstract`, not an occurrence of the keyword, and must not be
+   * flagged.
+   */
   private static scan(node: any, path: string, found: string[], depth: number): void {
     if (!node || typeof node !== 'object') return;
 
@@ -104,7 +112,48 @@ export class GtsModifiers {
         found.push(childPath);
         continue;
       }
-      this.scan(value, childPath, found, depth + 1);
+      this.scanSubschemas(key, value, childPath, found, depth);
+    }
+  }
+
+  /** Recurses into `key`'s value only through the schema-bearing positions it defines. */
+  private static scanSubschemas(key: string, value: any, path: string, found: string[], depth: number): void {
+    // `dependencies` (draft-07) is heterogeneous per-entry: each map entry is
+    // either a schema (schema dependency form) or a plain array of property
+    // names (property dependency form). `compatibility.ts`'s KEYWORDS table
+    // can't express that split without regressing its malformed-shape
+    // detection for the array form, so it's handled locally here instead:
+    // only the schema-shaped entries are schema positions worth scanning.
+    if (key === 'dependencies') {
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        for (const [name, sub] of Object.entries(value)) {
+          if (sub && typeof sub === 'object' && !Array.isArray(sub)) {
+            this.scan(sub, `${path}/${name}`, found, depth + 1);
+          }
+        }
+      }
+      return;
+    }
+
+    switch (SCHEMA_KEYWORD_POSITIONS[key]) {
+      case 'schema':
+        this.scan(value, path, found, depth + 1);
+        break;
+      case 'schemaList':
+        if (Array.isArray(value))
+          value.forEach((item, index) => this.scan(item, `${path}[${index}]`, found, depth + 1));
+        break;
+      case 'schemaMap':
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          for (const [name, sub] of Object.entries(value)) {
+            this.scan(sub, `${path}/${name}`, found, depth + 1);
+          }
+        }
+        break;
+      default:
+        // A data or unmodeled position: never a place a document-level keyword
+        // can legitimately occur, and never a place to look for one either.
+        break;
     }
   }
 }
