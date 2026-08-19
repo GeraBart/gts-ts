@@ -3,13 +3,14 @@ import { Command } from 'commander';
 import * as fs from 'fs';
 import * as path from 'path';
 import { validateGtsID, parseGtsID, matchIDPattern, idToUUID, extractID, GTS, createJsonEntity } from '../index';
+import { PACKAGE_VERSION } from '../version';
 
 const program = new Command();
 
 program
   .name('gts')
   .description('GTS CLI - Global Type System command-line interface')
-  .version('0.1.0')
+  .version(PACKAGE_VERSION)
   .option('--path <path>', 'Path to JSON and schema files', process.env.GTS_PATH)
   .option('--config <config>', 'Path to GTS config JSON file', process.env.GTS_CONFIG)
   .option('-v, --verbose', 'Verbose output', false);
@@ -221,7 +222,7 @@ program
       openapi: '3.0.0',
       info: {
         title: 'GTS API',
-        version: '0.1.0',
+        version: PACKAGE_VERSION,
         description: 'Global Type System API',
       },
       servers: [

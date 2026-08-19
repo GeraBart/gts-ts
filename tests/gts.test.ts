@@ -609,8 +609,12 @@ describe('GTS Store Operations', () => {
 
   describe('OP#11 - Attribute Access', () => {
     test('retrieves attribute values', () => {
+      // A bare, un-chained id (no `~`-marked type segment) is a prohibited
+      // single-segment instance id per `Gts.parseGtsID` - use the same
+      // chained shape as the other instance fixtures in this file.
+      const instanceId = 'gts.test.pkg.ns.person.v1~test.pkg.ns.john.v1.0';
       const instance = {
-        gtsId: 'gts.test.pkg.ns.person.v1.0',
+        gtsId: instanceId,
         name: 'John Doe',
         address: {
           city: 'New York',
@@ -620,16 +624,104 @@ describe('GTS Store Operations', () => {
 
       gts.register(instance);
 
-      const nameResult = gts.getAttribute('gts.test.pkg.ns.person.v1.0@name');
+      const nameResult = gts.getAttribute(`${instanceId}@name`);
       expect(nameResult.resolved).toBe(true);
       expect(nameResult.value).toBe('John Doe');
 
-      const cityResult = gts.getAttribute('gts.test.pkg.ns.person.v1.0@address.city');
+      const cityResult = gts.getAttribute(`${instanceId}@address.city`);
       expect(cityResult.resolved).toBe(true);
       expect(cityResult.value).toBe('New York');
 
-      const missingResult = gts.getAttribute('gts.test.pkg.ns.person.v1.0@missing');
+      const missingResult = gts.getAttribute(`${instanceId}@missing`);
       expect(missingResult.resolved).toBe(false);
+    });
+  });
+
+  describe('register() rejects malformed entity ids', () => {
+    // A malformed id would otherwise silently break every ancestor-chain
+    // computation downstream (`buildSchemaChain` and friends), which then
+    // fail open by treating the entity as if it had no ancestors at all -
+    // so `register()` must reject it up front, for every entity kind and
+    // regardless of `validateRefs`.
+    test('rejects a schema id with an extra dot-segment before the version', () => {
+      // 5 dot-segments before `v1~` - GTS ids take exactly 4
+      // (vendor.package.namespace.type).
+      const malformedId = 'gts.x.unit.tr.nestedorphanbug.base.v1~';
+      expect(() =>
+        gts.register({
+          $$id: malformedId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
+    });
+
+    test('rejects a version missing the leading v', () => {
+      const malformedId = 'gts.vendor.pkg.ns.type.1~';
+      expect(() =>
+        gts.register({
+          $$id: malformedId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
+    });
+
+    test('rejects a chained schema id missing the trailing tilde', () => {
+      const malformedId = 'gts.vendor.pkg.ns.type.v1';
+      expect(() =>
+        gts.register({
+          $$id: malformedId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
+    });
+
+    test('rejects an empty string id', () => {
+      expect(() => gts.register({ gtsId: '' })).toThrow("Invalid GTS entity id: ''");
+    });
+  });
+
+  describe('register() accepts anonymous instances by plain UUID (gts-spec §3.7)', () => {
+    // §3.7 permits a non-schema instance to be identified by a plain UUID
+    // in its `id` field, resolving its schema via a separate `type` field
+    // rather than by the id's own GTS-chain shape - register() must accept
+    // this shape instead of rejecting it as a malformed GTS id.
+    test('accepts a non-schema instance with a plain UUID id and a `type` field', () => {
+      const uuidId = '7a1d2f34-5678-49ab-9012-abcdef123456';
+      expect(() =>
+        gts.register({
+          type: 'gts.x.test6anon.events.type.v1~x.commerce.orders.order_placed.v1.0~',
+          id: uuidId,
+          tenantId: '11111111-2222-3333-8444-555555555555',
+          occurredAt: '2025-09-20T18:35:00Z',
+          payload: { orderId: 'af0e3c1b-8f1e-4a27-9a9b-b7b9b70c1f01' },
+        })
+      ).not.toThrow();
+    });
+
+    test('still rejects a SCHEMA whose id is a plain UUID (not a valid GTS Type id)', () => {
+      // The UUID exception is instance-only - a schema must always carry a
+      // well-formed GTS Type ID.
+      const uuidId = '7a1d2f34-5678-49ab-9012-abcdef123456';
+      expect(() =>
+        gts.register({
+          $$id: uuidId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${uuidId}'`);
+    });
+
+    test('still rejects an id that is neither a valid GTS id nor a valid UUID', () => {
+      const malformedId = 'not-a-valid-id-at-all';
+      expect(() =>
+        gts.register({
+          gtsId: malformedId,
+          name: 'irrelevant',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
     });
   });
 

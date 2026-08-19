@@ -203,6 +203,22 @@ const ROWS: Row[] = [
     full: 'incompatible',
   },
   {
+    change: 'dropping maxLength for an enum whose members are all within it',
+    old: { required: ['a'], properties: { a: { type: 'string', maxLength: 100 } }, ...CLOSED },
+    new: { required: ['a'], properties: { a: { type: 'string', enum: ['gold', 'platinum'] } }, ...CLOSED },
+    backward: 'incompatible',
+    forward: 'compatible',
+    full: 'incompatible',
+  },
+  {
+    change: 'dropping maxLength for an enum with a member outside it',
+    old: { required: ['a'], properties: { a: { type: 'string', maxLength: 5 } }, ...CLOSED },
+    new: { required: ['a'], properties: { a: { type: 'string', enum: ['short', 'way-too-long-value'] } }, ...CLOSED },
+    backward: 'incompatible',
+    forward: 'incompatible',
+    full: 'incompatible',
+  },
+  {
     change: 'renaming property',
     old: { required: ['a'], properties: { a: { type: 'string' } }, ...CLOSED },
     new: { required: ['b'], properties: { b: { type: 'string' } }, ...CLOSED },
@@ -272,6 +288,71 @@ describe('OP#8 - inconclusive checks report `unknown`', () => {
     expect(result.forward_compatibility).toBe('unknown');
     expect(result.full_compatibility).toBe('unknown');
     // `unknown` is not evidence of incompatibility, but it is not a pass either.
+    expect(result.is_fully_compatible).toBe(false);
+  });
+
+  test('a const already matching the old pattern lets the new schema drop it, forward-compatibly', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.unknown.patternconst.v1.0~';
+    const newId = 'gts.x.unit.unknown.patternconst.v1.1~';
+
+    // `pattern` is still compared by exact equality in general (see the test
+    // above), but a `const`/`enum` value the new schema pins down that
+    // already satisfies the old pattern makes dropping the pattern itself
+    // harmless from the "does everything new could ever hold also satisfy
+    // old" angle - i.e. forward compatibility, `subsumes(oldSchema,
+    // newSchema)`. (Backward asks the opposite question - "does everything
+    // old could ever hold also satisfy new" - and stays `incompatible`
+    // here regardless of this fix, because narrowing to one `const` value
+    // legitimately excludes strings old admitted.)
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      required: ['a'],
+      properties: { a: { type: 'string', pattern: '^[a-z]+$' } },
+      additionalProperties: false,
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      required: ['a'],
+      properties: { a: { type: 'string', const: 'hello' } },
+      additionalProperties: false,
+    });
+
+    const result = gts.checkCompatibility(oldId, newId);
+
+    expect(result.forward_compatibility).toBe('compatible');
+    expect(result.backward_compatibility).toBe('incompatible');
+  });
+
+  test('a const that does not match the old pattern stays unknown, not forward-compatible', () => {
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.unknown.patternconstbad.v1.0~';
+    const newId = 'gts.x.unit.unknown.patternconstbad.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      required: ['a'],
+      properties: { a: { type: 'string', pattern: '^[a-z]+$' } },
+      additionalProperties: false,
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      required: ['a'],
+      properties: { a: { type: 'string', const: 'HELLO' } },
+      additionalProperties: false,
+    });
+
+    const result = gts.checkCompatibility(oldId, newId);
+
+    expect(result.forward_compatibility).toBe('unknown');
     expect(result.is_fully_compatible).toBe(false);
   });
 

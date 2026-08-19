@@ -213,6 +213,16 @@ export class Gts {
     }
   }
 
+  /**
+   * Whether `value` is a plain UUID (v4/v5-shaped) string - the id form
+   * gts-spec §3.7 permits for an "anonymous instance" (a non-schema entity
+   * identified by a bare UUID, with schema resolution carried by a separate
+   * `type` field rather than by the id's own GTS-chain shape).
+   */
+  static isUuid(value: string): boolean {
+    return UUID_REGEX.test(value);
+  }
+
   static validateGtsID(id: string): ValidationResult {
     const isWildcard = id.includes('*');
     try {

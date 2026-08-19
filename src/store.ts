@@ -3,7 +3,7 @@ import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX, MAX_SCHEMA_DEP
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';
 import { XGtsRefValidator } from './x-gts-ref';
-import { GtsCompatibility, findCrossedBound } from './compatibility';
+import { GtsCompatibility, findCrossedBound, isEmptySchema } from './compatibility';
 import { GtsModifiers } from './modifiers';
 
 interface ResolvedSchema {
@@ -12,6 +12,15 @@ interface ResolvedSchema {
   additionalProperties?: boolean;
   type?: string;
 }
+
+/**
+ * Keywords that describe an object level's structure rather than the value
+ * constraints of a single property - gts-rust's `STRUCTURAL_KEYWORDS`
+ * (`schema_derivation.rs`), used by `declaredTraitSchema`/`absorbProperty` to
+ * decide which keywords a restated property replaces wholesale versus which
+ * ones compose across `allOf` branches.
+ */
+const TRAIT_STRUCTURAL_KEYWORDS = ['properties', 'required', 'additionalProperties'];
 
 export class GtsStore {
   private byId: Map<string, JsonEntity> = new Map();
@@ -47,6 +56,21 @@ export class GtsStore {
   }
 
   register(entity: JsonEntity): void {
+    // A malformed entity id would silently break every ancestor-chain
+    // computation downstream (`buildSchemaChain` and friends), which then
+    // fail open by treating the entity as if it had no ancestors at all -
+    // so, like the modifier-declaration check below, this MUST be rejected
+    // unconditionally at registration time, regardless of `validateRefs` or
+    // any other config. A SCHEMA must always carry a well-formed GTS Type
+    // ID. A non-schema INSTANCE may instead be an "anonymous instance"
+    // (gts-spec §3.7): identified by a plain UUID, with schema resolution
+    // carried by its own `type` field rather than by the id's GTS-chain
+    // shape - so a plain UUID id is accepted for instances only.
+    const hasValidId = Gts.isValidGtsID(entity.id) || (!entity.isSchema && Gts.isUuid(entity.id));
+    if (!hasValidId) {
+      throw new Error(`Invalid GTS entity id: '${entity.id}'`);
+    }
+
     if (this.config.validateRefs) {
       for (const ref of entity.references) {
         if (!this.byId.has(ref)) {
@@ -912,7 +936,12 @@ export class GtsStore {
     // parent is taken from the chain. A body that references the parent via
     // `allOf` + `$ref` and one that restates the parent's fields are both valid
     // derivation forms and are checked identically.
-    const chain = this.buildSchemaChain(schemaId);
+    let chain: string[];
+    try {
+      chain = this.buildSchemaChain(schemaId);
+    } catch (err) {
+      return { id: schemaId, ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
     const parentId = chain.length > 1 ? chain[chain.length - 2] : null;
     if (!parentId) {
       // Base schema with no parent → still validate traits
@@ -970,7 +999,12 @@ export class GtsStore {
    * `const` in the trait-schema, which the standard validation in step 4 enforces.
    */
   private validateSchemaTraits(schemaId: string): ValidationResult {
-    const chain = this.buildSchemaChain(schemaId);
+    let chain: string[];
+    try {
+      chain = this.buildSchemaChain(schemaId);
+    } catch (err) {
+      return { id: schemaId, ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
 
     const traitSchemas: any[] = [];
     // `x-gts-traits-schema: false` is the "no traits permitted" declaration and
@@ -993,6 +1027,15 @@ export class GtsStore {
         if (declaredSchema === false) {
           traitsProhibited = true;
         } else if (declaredSchema !== true) {
+          const isPlainObject =
+            typeof declaredSchema === 'object' && declaredSchema !== null && !Array.isArray(declaredSchema);
+          if (!isPlainObject) {
+            return {
+              id: schemaId,
+              ok: false,
+              error: `x-gts-traits-schema in '${chainSchemaId}' must be an object subschema or a boolean`,
+            };
+          }
           try {
             traitSchemas.push(this.resolveTraitSchemaRefs(declaredSchema, new Set()));
           } catch (e) {
@@ -1031,7 +1074,7 @@ export class GtsStore {
     // The effective trait-schema must be satisfiable in the first place. This
     // is a property of the composed schema, so - unlike completeness - it is
     // checked for abstract types too.
-    const unsatisfiable = this.findUnsatisfiableTrait(traitSchemas, '');
+    const unsatisfiable = this.validateTraitChainSatisfiability(traitSchemas);
     if (unsatisfiable) {
       return { id: schemaId, ok: false, error: `effective trait schema cannot be satisfied: ${unsatisfiable}` };
     }
@@ -1081,83 +1124,320 @@ export class GtsStore {
    * leaves every declared trait property expressible (§9.7.5, "if the effective
    * trait schema cannot be satisfied ... schema validation MUST fail").
    *
-   * Two ways a descendant branch can make an ancestor's trait unusable:
-   *   - it closes its own branch with `additionalProperties: false` without
-   *     restating the ancestor's property, which orphans it - `allOf` branches
-   *     are evaluated independently, so the closed branch rejects the value;
-   *   - it redeclares the property with a disjoint `type`, so no value can
-   *     satisfy both branches.
+   * Faithful port of gts-rust's `schema_traits::validate_trait_schema_compatibility`,
+   * which - for each level `i` of the chain - builds `ancestor` and `descendant`
+   * as `{allOf: [...]}` wrappers over the chain prefixes `[0..i)` / `[0..i+1)`
+   * and runs TWO separate checks against them:
+   *
+   *   1. `schema_derivation::validate_closed_descendant_branches` - a raw,
+   *      structural walk (recursing into every shared property, and into the
+   *      descendant's own `allOf`) that finds a closed `allOf` branch, at any
+   *      depth, orphaning a property an earlier branch declared. Ported here
+   *      as `collectClosedBranchOrphanErrors`, fed by `resolveSchemaFully`
+   *      (this file's `flatten_schema` analog) flattening the ancestor
+   *      prefix once per chain level, per gts-rust's own
+   *      `validate_closed_descendant_branches` entry point. Deliberately NOT
+   *      gated on required-ness: orphaning any property via a closed
+   *      conjunct, required or not, always makes that conjunct reject a
+   *      value the other allows.
+   *
+   *   2. `schema_derivation::validate_derivation` - "does the descendant's
+   *      *declared* schema stay included in the ancestor's *declared* schema".
+   *      Ported here via `declaredTraitSchema` (a faithful port of
+   *      `declared_schema`/`absorb_declaration`/`absorb_property`/
+   *      `merge_additional_properties_constraint`) plus the existing, already
+   *      verified `GtsCompatibility.compareSchemas` as the accepted-set-
+   *      inclusion checker (gts-rust's `check_accepted_set_inclusion`). Also
+   *      ports `collect_disabled_base_properties`, the one admission rule
+   *      `validate_derivation` runs alongside inclusion that inclusion itself
+   *      does not express (disabling an inherited property narrows the
+   *      accepted set, so plain subsumption lets it through).
    *
    * Returns a description of the first problem found, or null when satisfiable.
    */
-  private findUnsatisfiableTrait(branches: any[], path: string, depth: number = 0): string | null {
-    // Fail closed: an unexplored branch is reported rather than assumed fine.
-    if (depth > MAX_SCHEMA_DEPTH) {
-      return `trait schema at '${path}' nests deeper than ${MAX_SCHEMA_DEPTH} levels and cannot be verified`;
-    }
-
-    const objectBranches = branches.filter((b) => typeof b === 'object' && b !== null);
-    if (objectBranches.length === 0) return null;
-
-    // Every property name declared by any branch at this level.
-    const declaredBy = new Map<string, any[]>();
-    for (const branch of objectBranches) {
-      const props = branch.properties;
-      if (!props || typeof props !== 'object') continue;
-      for (const [name, subSchema] of Object.entries(props)) {
-        const existing = declaredBy.get(name);
-        if (existing) existing.push(subSchema);
-        else declaredBy.set(name, [subSchema]);
-      }
-    }
-
-    for (const [name, subSchemas] of declaredBy) {
-      const propPath = path ? `${path}.${name}` : name;
-
-      for (const branch of objectBranches) {
-        if (branch.additionalProperties !== false) continue;
-        const declaresLocally = !!branch.properties && name in branch.properties;
-        if (!declaresLocally) {
-          return `trait '${propPath}' is declared by one branch but excluded by a closed branch that does not restate it`;
-        }
+  private validateTraitChainSatisfiability(traitSchemas: any[]): string | null {
+    // Both checks run per chain level - `ancestor = chain[0..i)`,
+    // `descendant = chain[0..i+1)` - matching gts-rust's own loop
+    // (`validate_trait_schema_compatibility`), rather than over the whole
+    // chain's flattened `allOf` branches at once.
+    for (let i = 1; i < traitSchemas.length; i++) {
+      // 1) Closed-branch orphan check - raw/structural, unconditional on
+      // required-ness (see doc comment above). `ancestorFlat` is the
+      // ancestor prefix flattened ONCE (gts-rust's `flatten_schema`, i.e.
+      // this file's `resolveSchemaFully`); the descendant prefix is passed
+      // RAW so the recursion can walk its own `allOf` directly.
+      const ancestorFlat = this.resolveSchemaFully({ allOf: traitSchemas.slice(0, i) });
+      const descendantRaw = { allOf: traitSchemas.slice(0, i + 1) };
+      const orphanErrors = this.collectClosedBranchOrphanErrors(ancestorFlat, descendantRaw, '', 0);
+      if (orphanErrors.length > 0) {
+        return orphanErrors.join('; ');
       }
 
-      const conflict =
-        this.findTypeConflict(subSchemas) || this.findValueConflict(subSchemas) || findCrossedBound(subSchemas);
-      if (conflict) {
-        return `trait '${propPath}' cannot be satisfied: ${conflict}`;
+      // 2) Declared-schema-fold + accepted-set-inclusion check, per chain
+      // level.
+      const ancestorDeclared = this.declaredTraitSchema({ allOf: traitSchemas.slice(0, i) }, 0);
+      const descendantDeclared = this.declaredTraitSchema({ allOf: traitSchemas.slice(0, i + 1) }, 0);
+
+      const disabledError = this.findDisabledBaseProperty(ancestorDeclared, descendantDeclared);
+      if (disabledError) {
+        return disabledError;
       }
 
-      const nested = this.findUnsatisfiableTrait(subSchemas, propPath, depth + 1);
-      if (nested) return nested;
+      // `forward`: Valid(descendantDeclared) ⊆ Valid(ancestorDeclared) - the
+      // inclusion direction §9.7.5 requires. Admission fails closed (mirroring
+      // gts-rust's own comment on `validate_derivation`): `unknown` is
+      // rejected exactly like `incompatible`, only `compatible` passes.
+      const { forward } = GtsCompatibility.compareSchemas(this, ancestorDeclared, descendantDeclared);
+      if (forward !== 'compatible') {
+        return `trait-schema level ${i} is not a valid narrowing of the preceding effective trait schema (${forward})`;
+      }
     }
 
     return null;
   }
 
-  /** Returns a description when the `type` keywords across subschemas cannot all hold. */
-  private findTypeConflict(subSchemas: any[]): string | null {
-    let allowed: Set<string> | null = null;
-    const seen: string[] = [];
+  /**
+   * Faithful port of gts-rust's `collect_closed_descendant_branch_errors`
+   * (`schema_derivation.rs`): a descendant branch that closes itself with
+   * `additionalProperties: false` must restate every property the flattened
+   * ancestor declared, or the closed branch rejects a value the ancestor
+   * allows once composed via `allOf` - checked at every depth, not only the
+   * top level, since a closed branch nested inside a shared property's own
+   * value constrains that same object instance just as directly.
+   *
+   * `ancestorFlat` is flattened ONCE by the caller and re-flattened here only
+   * for the property this call recurses into (mirroring gts-rust's own
+   * `flatten_schema(ancestor_prop)` at each level); `descendantRaw` is walked
+   * as authored so its own `allOf` branches are visited directly.
+   */
+  private collectClosedBranchOrphanErrors(
+    ancestorFlat: ResolvedSchema,
+    descendantRaw: any,
+    path: string,
+    depth: number
+  ): string[] {
+    const errors: string[] = [];
+    if (depth >= MAX_SCHEMA_DEPTH) {
+      errors.push(
+        `closed-branch orphan check at '${path || '<root>'}' exceeds ${MAX_SCHEMA_DEPTH} levels and cannot be resolved`
+      );
+      return errors;
+    }
+    if (typeof descendantRaw !== 'object' || descendantRaw === null || Array.isArray(descendantRaw)) {
+      return errors;
+    }
 
-    for (const subSchema of subSchemas) {
-      if (typeof subSchema !== 'object' || subSchema === null || subSchema.type === undefined) continue;
-      const types = new Set<string>(Array.isArray(subSchema.type) ? subSchema.type : [subSchema.type]);
-      // `integer` is a subset of `number`, so the two are compatible.
-      if (types.has('number')) types.add('integer');
-      seen.push(Array.isArray(subSchema.type) ? subSchema.type.join('|') : String(subSchema.type));
+    const ancestorProps = ancestorFlat.properties || {};
+    const descendantProps: Record<string, any> = descendantRaw.properties || {};
 
-      if (allowed === null) {
-        allowed = types;
-        continue;
-      }
-      allowed = new Set(Array.from(allowed).filter((t) => types.has(t)));
-      if (allowed.size === 0) {
-        return seen.join(' vs ');
+    if (descendantRaw.additionalProperties === false) {
+      const orphaned = Object.keys(ancestorProps)
+        .filter((name) => ancestorProps[name] !== false && !(name in descendantProps))
+        .sort();
+      for (const name of orphaned) {
+        const fullPath = path ? `${path}.${name}` : name;
+        errors.push(
+          `Property '${fullPath}' is declared in a preceding trait-schema branch but excluded by additionalProperties: false`
+        );
       }
     }
 
+    const commonNames = Object.keys(descendantProps)
+      .filter((name) => name in ancestorProps)
+      .sort();
+    for (const name of commonNames) {
+      const nextAncestorFlat = this.resolveSchemaFully(ancestorProps[name]);
+      const nextPath = path ? `${path}.${name}` : name;
+      errors.push(
+        ...this.collectClosedBranchOrphanErrors(nextAncestorFlat, descendantProps[name], nextPath, depth + 1)
+      );
+    }
+
+    if (Array.isArray(descendantRaw.allOf)) {
+      for (const item of descendantRaw.allOf) {
+        errors.push(...this.collectClosedBranchOrphanErrors(ancestorFlat, item, path, depth + 1));
+      }
+    }
+
+    return errors;
+  }
+
+  /**
+   * Faithful port of gts-rust's `collect_disabled_base_properties`: rejects a
+   * descendant trait-schema level that switches an ancestor-declared property
+   * off with `false`. Plain accepted-set inclusion permits this (rejecting
+   * every instance that carries the property keeps the descendant's accepted
+   * set inside the ancestor's), but disabling an inherited property is not a
+   * valid narrowing of the trait-schema chain, so this is a separate
+   * admission rule rather than a compatibility one.
+   */
+  private findDisabledBaseProperty(ancestorDeclared: any, descendantDeclared: any): string | null {
+    const ancestorProps =
+      ancestorDeclared && typeof ancestorDeclared === 'object' ? ancestorDeclared.properties || {} : {};
+    const descendantProps =
+      descendantDeclared && typeof descendantDeclared === 'object' ? descendantDeclared.properties || {} : {};
+    for (const [name, property] of Object.entries(descendantProps)) {
+      if (property === false && ancestorProps[name] !== undefined) {
+        return `property '${name}': trait-schema disables a property defined by a preceding trait-schema level`;
+      }
+    }
     return null;
+  }
+
+  /**
+   * Faithful port of gts-rust's `declared_schema`/`absorb_declaration` (see
+   * `schema_derivation.rs`): reduces a schema to what it *declares*, folding
+   * `allOf` branches in order so that a later declaration of a property's own
+   * (non-structural) keywords replaces earlier ones - a level that restates a
+   * property redeclares that property's value constraints outright, it does
+   * not intersect with what came before. Object structure (`properties`,
+   * `required`, `additionalProperties`) composes instead, via `absorbProperty`
+   * / `mergeAdditionalPropertiesConstraint`.
+   *
+   * Below `MAX_SCHEMA_DEPTH` the schema is returned as authored, matching
+   * gts-rust's own fail-closed choice: an unreduced declaration reads as
+   * looser than it is to the inclusion checker, so recursing further would
+   * only affect how conservative the rejection is, never turn a real problem
+   * into a false pass.
+   */
+  private declaredTraitSchema(schema: any, depth: number = 0): any {
+    if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+      return schema;
+    }
+    if (depth >= MAX_SCHEMA_DEPTH) {
+      return schema;
+    }
+
+    const declared: Record<string, any> = {};
+    const additionalProperties: { value?: any } = {};
+
+    if (Array.isArray(schema.allOf)) {
+      for (const branch of schema.allOf) {
+        const declaredBranch = this.declaredTraitSchema(branch, depth + 1);
+        if (typeof declaredBranch === 'object' && declaredBranch !== null && !Array.isArray(declaredBranch)) {
+          this.absorbDeclaration(declared, additionalProperties, declaredBranch, depth);
+        }
+      }
+    }
+    this.absorbDeclaration(declared, additionalProperties, schema, depth);
+
+    if ('value' in additionalProperties) {
+      declared.additionalProperties = additionalProperties.value;
+    }
+
+    return declared;
+  }
+
+  /** Folds one declaration level into the accumulated one (see `declaredTraitSchema`). */
+  private absorbDeclaration(
+    declared: Record<string, any>,
+    additionalProperties: { value?: any },
+    source: Record<string, any>,
+    depth: number
+  ): void {
+    for (const [keyword, value] of Object.entries(source)) {
+      switch (keyword) {
+        case 'allOf':
+          break;
+        case 'additionalProperties':
+          this.mergeAdditionalPropertiesConstraint(additionalProperties, value);
+          break;
+        case 'properties': {
+          if (typeof value !== 'object' || value === null || Array.isArray(value)) break;
+          const target: Record<string, any> = (declared.properties = declared.properties || {});
+          for (const [name, property] of Object.entries(value)) {
+            const resolvedProperty = this.declaredTraitSchema(property, depth + 1);
+            if (target[name] !== undefined) {
+              this.absorbProperty(target, name, resolvedProperty, depth + 1);
+            } else {
+              target[name] = resolvedProperty;
+            }
+          }
+          break;
+        }
+        case 'required': {
+          if (!Array.isArray(value)) break;
+          const target: string[] = (declared.required = declared.required || []);
+          for (const name of value) {
+            if (!target.includes(name)) target.push(name);
+          }
+          break;
+        }
+        default:
+          // Later declaration of the same keyword wins (overwrite).
+          declared[keyword] = value;
+      }
+    }
+  }
+
+  /**
+   * Faithful port of gts-rust's `absorb_property`: folds an overlay's
+   * declaration of a property into the one inherited from an earlier `allOf`
+   * branch. The overlay's own non-structural keywords replace the inherited
+   * ones wholesale (a restated property redeclares its value constraints, it
+   * does not inherit an unrestated bound), while `properties`/`required`/
+   * `additionalProperties` compose structurally by re-folding the overlay's
+   * own structural keys on top of the inherited ones via `absorbDeclaration`.
+   */
+  private absorbProperty(target: Record<string, any>, name: string, overlay: any, depth: number): void {
+    const inherited = target[name];
+    const inheritedIsObject = typeof inherited === 'object' && inherited !== null && !Array.isArray(inherited);
+    const overlayIsObject = typeof overlay === 'object' && overlay !== null && !Array.isArray(overlay);
+
+    if (depth >= MAX_SCHEMA_DEPTH || !inheritedIsObject || !overlayIsObject) {
+      target[name] = overlay;
+      return;
+    }
+
+    const composed: Record<string, any> = {};
+    for (const [keyword, value] of Object.entries(overlay)) {
+      if (!TRAIT_STRUCTURAL_KEYWORDS.includes(keyword)) {
+        composed[keyword] = value;
+      }
+    }
+
+    const additionalProperties: { value?: any } = {};
+    if (inherited.additionalProperties !== undefined) {
+      additionalProperties.value = inherited.additionalProperties;
+    }
+    for (const keyword of ['properties', 'required']) {
+      if (inherited[keyword] !== undefined) {
+        composed[keyword] = inherited[keyword];
+      }
+    }
+
+    this.absorbDeclaration(composed, additionalProperties, overlay, depth);
+
+    if ('value' in additionalProperties) {
+      composed.additionalProperties = additionalProperties.value;
+    }
+
+    target[name] = composed;
+  }
+
+  /**
+   * Faithful port of gts-rust's `merge_additional_properties_constraint`: a
+   * closedness-preserving lattice over `additionalProperties` values - a
+   * schema equivalent to `false` (closed) always wins, a schema equivalent to
+   * `true` (open) never overrides an existing constraint, and anything else
+   * replaces the accumulated value. Mirrors `allOf` composition, where the
+   * level stays closed if ANY branch gives `additionalProperties` a
+   * false-equivalent schema, so a permissive overlay can never loosen a
+   * closed ancestor.
+   */
+  private mergeAdditionalPropertiesConstraint(accumulated: { value?: any }, candidate: any): void {
+    const currentBool = 'value' in accumulated ? this.schemaBooleanValue(accumulated.value) : undefined;
+    if (currentBool === false) return; // already closed, stays closed
+    const candidateBool = this.schemaBooleanValue(candidate);
+    if (candidateBool === true && 'value' in accumulated) return; // intersecting with `true` changes nothing
+    accumulated.value = candidate;
+  }
+
+  /** `true`/`false` when `schema` is boolean-equivalent, `undefined` otherwise. */
+  private schemaBooleanValue(schema: any): boolean | undefined {
+    if (schema === false) return false;
+    if (isEmptySchema(schema)) return true;
+    return undefined;
   }
 
   /**
@@ -1241,7 +1521,16 @@ export class GtsStore {
       return `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`;
     }
 
-    const finalBase = id ? this.findFinalBaseInChain(id) : null;
+    // `register()` rejects a malformed id up front, so `findFinalBaseInChain`
+    // should never actually throw here; the catch only keeps this
+    // string-or-null-returning check from turning into an uncaught exception
+    // if that invariant is ever violated.
+    let finalBase: string | null;
+    try {
+      finalBase = id ? this.findFinalBaseInChain(id) : null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
     if (finalBase) {
       return `base type '${finalBase}' is final and cannot be extended`;
     }
@@ -1305,8 +1594,15 @@ export class GtsStore {
       }
 
       return chain;
-    } catch {
-      return [schemaId];
+    } catch (err) {
+      // Returning a truncated (or single-element) chain would silently hide
+      // every ancestor of `schemaId` from the caller, which then fails open
+      // by treating the entity as if it had no parent/trait-schema/final-base
+      // ancestors at all - so, like `resolveTraitSchemaRefs`'s depth guard
+      // above, the caller is told instead of being handed a permissive
+      // fallback. `register()` rejects malformed ids up front, so this
+      // should be unreachable in practice.
+      throw new Error(`Cannot build schema chain for '${schemaId}': ${err instanceof Error ? err.message : err}`);
     }
   }
 
@@ -1414,19 +1710,62 @@ export class GtsStore {
    *
    * Both are collected together so that a caller can never read a merged
    * property list against a stale or differently-merged `required` list.
+   *
+   * A property can be redeclared by more than one contributing branch (the
+   * schema's own `properties` and each `allOf` branch, recursively) - real
+   * `allOf` semantics require a value to satisfy every branch independently,
+   * not just the last one written, so merging by wholesale-replacing an
+   * earlier branch's subschema with a later one silently drops whatever the
+   * earlier branch declared and the later branch did not repeat (most
+   * notably `default`). Every branch's subschema for a name is accumulated
+   * and combined via `mergeTraitPropertySchemas` instead.
    */
   private collectTraitSurface(
     schema: any,
     depth: number = 0
   ): { properties: Record<string, any>; required: Set<string> } {
+    const { declaredBy, required } = this.collectTraitDeclarations(schema, depth);
+
     const properties: Record<string, any> = {};
-    const required = new Set<string>();
-    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) {
-      return { properties, required };
+    for (const [name, subSchemas] of declaredBy) {
+      properties[name] = subSchemas.length === 1 ? subSchemas[0] : this.mergeTraitPropertySchemas(subSchemas);
     }
 
+    return { properties, required };
+  }
+
+  /**
+   * The raw, per-branch-unmerged form `collectTraitSurface` collapses into
+   * its `properties` map: every subschema any branch (recursively through
+   * its own `allOf`) declares for a property name, kept as separate list
+   * entries rather than merged into one value.
+   *
+   * `collectTraitSurface` collapses this for `applyTraitDefaults`, which only
+   * ever needs one schema per name to read `default` from and recurse into.
+   * (Trait-schema chain *satisfiability* is a separate concern, answered by
+   * `validateTraitChainSatisfiability` via `resolveSchemaFully` /
+   * `compareOverlayToBase` instead of this flattening.)
+   */
+  private collectTraitDeclarations(
+    schema: any,
+    depth: number = 0
+  ): { declaredBy: Map<string, any[]>; required: Set<string> } {
+    const declaredBy = new Map<string, any[]>();
+    const required = new Set<string>();
+    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) {
+      return { declaredBy, required };
+    }
+
+    const addBranchProperties = (props: Record<string, any>) => {
+      for (const [name, subSchema] of Object.entries(props)) {
+        const existing = declaredBy.get(name);
+        if (existing) existing.push(subSchema);
+        else declaredBy.set(name, [subSchema]);
+      }
+    };
+
     if (typeof schema.properties === 'object' && schema.properties !== null) {
-      Object.assign(properties, schema.properties);
+      addBranchProperties(schema.properties);
     }
     if (Array.isArray(schema.required)) {
       for (const name of schema.required) {
@@ -1436,13 +1775,45 @@ export class GtsStore {
 
     if (Array.isArray(schema.allOf)) {
       for (const item of schema.allOf) {
-        const branch = this.collectTraitSurface(item, depth + 1);
-        Object.assign(properties, branch.properties);
+        const branch = this.collectTraitDeclarations(item, depth + 1);
+        for (const [name, subSchemas] of branch.declaredBy) {
+          const existing = declaredBy.get(name);
+          if (existing) existing.push(...subSchemas);
+          else declaredBy.set(name, [...subSchemas]);
+        }
         for (const name of branch.required) required.add(name);
       }
     }
 
-    return { properties, required };
+    return { declaredBy, required };
+  }
+
+  /**
+   * Combines more than one branch's subschema for the same property name
+   * into one schema that `applyTraitDefaults` can read.
+   *
+   * `applyTraitDefaults` looks for a `default` directly on the property
+   * schema it's given, then recurses into that same schema as a sub-schema
+   * for nested properties/required. Wrapping the branches in `{ allOf: [...] }`
+   * gives the recursive call everything it needs (nested `properties` and
+   * `required` still resolve correctly, since `collectTraitSurface` already
+   * knows how to flatten `allOf`); the one piece `allOf` doesn't surface for
+   * a direct read is `default`, so it's hoisted onto the wrapper too.
+   *
+   * `subSchemas` is built root-to-leaf (the chain walk that produces
+   * `traitSchemas` runs from the base schema down to the leaf), so when more
+   * than one branch declares a `default` for the same property, the LAST
+   * match is the most-derived (descendant) declaration. That's the one that
+   * wins, consistent with the descendant-overrides-ancestor convention used
+   * everywhere else in this file (e.g. `applyMergePatch`'s RFC 7396
+   * last-wins merge) - a descendant redeclaring a property's default is
+   * meant to override its ancestor's, not the other way around.
+   */
+  private mergeTraitPropertySchemas(subSchemas: any[]): any {
+    const withDefault = [...subSchemas].reverse().find((s) => typeof s === 'object' && s !== null && 'default' in s);
+    const merged: any = { allOf: subSchemas };
+    if (withDefault) merged.default = withDefault.default;
+    return merged;
   }
 
   // Detect cyclic $$ref/$ref references reachable from a schema's content
@@ -1799,6 +2170,20 @@ export class GtsStore {
 
     if (typeof base !== 'object' || base === null) {
       return errors;
+    }
+
+    // Cross-keyword conflicts: the loosening/drop checks below only compare
+    // the SAME keyword between `derived` and `base` (e.g. `maximum` vs
+    // `maximum`), so they cannot see a conflict between DIFFERENT keywords
+    // declared by the two sides on the same property - e.g. `derived`
+    // declares `maximum: 5` while `base` already declared `minimum: 10`: no
+    // value satisfies both, but nothing above compares `minimum` against
+    // `maximum`. `findValueConflict`/`findCrossedBound` check whether a SET
+    // of sibling subschemas has a non-empty joint value-set/bound-range
+    // intersection, which is exactly this question.
+    const crossKeywordConflict = this.findValueConflict([derived, base]) || findCrossedBound([derived, base]);
+    if (crossKeywordConflict) {
+      errors.push(`Property '${propPath}' cannot be satisfied: ${crossKeywordConflict}`);
     }
 
     // Type check

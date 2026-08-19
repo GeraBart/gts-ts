@@ -18,20 +18,7 @@ import {
   ValidateEntityBody,
 } from './types';
 import * as gts from '../index';
-
-/**
- * Version reported by the generated OpenAPI document. Read from `package.json`
- * so it cannot drift from the published version; the file sits two levels above
- * both `src/server` (ts-node) and `dist/server` (compiled output).
- */
-const PACKAGE_VERSION: string = (() => {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require('../../package.json').version || '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-})();
+import { PACKAGE_VERSION } from '../version';
 
 export class GtsServer {
   private fastify: FastifyInstance;
@@ -718,6 +705,28 @@ export class GtsServer {
 
   private getOpenAPIPaths(): any {
     return {
+      '/health': {
+        get: {
+          summary: 'Check server liveness',
+          operationId: 'health',
+          responses: {
+            200: {
+              description: 'Server status',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      status: { type: 'string' },
+                      timestamp: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
       '/entities': {
         get: {
           summary: 'Get all entities in the registry',
@@ -770,13 +779,110 @@ export class GtsServer {
           },
         },
       },
+      '/entities/{id}': {
+        get: {
+          summary: 'Get a single entity by its GTS ID',
+          operationId: 'getEntity',
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              description: 'GTS ID of the entity',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'The entity',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string' },
+                      content: { type: 'object' },
+                    },
+                  },
+                },
+              },
+            },
+            404: {
+              description: 'Entity not found',
+            },
+          },
+        },
+      },
+      '/entities/bulk': {
+        post: {
+          summary: 'Add multiple entities in a single call',
+          operationId: 'addEntities',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { type: 'array', items: { type: 'object' } },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Bulk operation result',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      ok: { type: 'boolean' },
+                      registered: { type: 'array', items: { type: 'string' } },
+                      errors: { type: 'array', items: { type: 'string' } },
+                    },
+                    required: ['ok'],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/type-schemas': {
+        post: {
+          summary: 'Register a GTS Type Schema under an explicit type_id',
+          operationId: 'addTypeSchema',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    type_id: { type: 'string' },
+                    type_schema: { type: 'object' },
+                  },
+                  required: ['type_id', 'type_schema'],
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Operation result',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/OperationResult' },
+                },
+              },
+            },
+          },
+        },
+      },
       '/validate-id': {
         get: {
           summary: 'Validate a GTS ID',
           operationId: 'validateID',
           parameters: [
             {
-              name: 'id',
+              name: 'gts_id',
               in: 'query',
               required: true,
               description: 'GTS ID to validate',
@@ -789,6 +895,245 @@ export class GtsServer {
               content: {
                 'application/json': {
                   schema: { $ref: '#/components/schemas/ValidationResult' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/extract-id': {
+        post: {
+          summary: 'Extract the GTS ID implied by an entity body',
+          operationId: 'extractID',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: { type: 'object' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Extraction result',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/parse-id': {
+        get: {
+          summary: 'Parse a GTS ID into its component segments',
+          operationId: 'parseID',
+          parameters: [
+            {
+              name: 'gts_id',
+              in: 'query',
+              required: true,
+              description: 'GTS ID to parse',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Parsed segments',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string' },
+                      ok: { type: 'boolean' },
+                      segments: { type: 'array', items: { type: 'object' } },
+                      error: { type: 'string' },
+                      is_type: { type: 'boolean' },
+                      is_type_schema: { type: 'boolean' },
+                      is_wildcard: { type: 'boolean' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/match-id-pattern': {
+        get: {
+          summary: 'Check whether a candidate GTS ID matches a wildcard pattern',
+          operationId: 'matchIDPattern',
+          parameters: [
+            {
+              name: 'pattern',
+              in: 'query',
+              required: true,
+              description: 'GTS ID pattern, possibly containing wildcards',
+              schema: { type: 'string' },
+            },
+            {
+              name: 'candidate',
+              in: 'query',
+              required: true,
+              description: 'Candidate GTS ID to test against the pattern',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Match result',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/uuid': {
+        get: {
+          summary: 'Derive the deterministic UUID for a GTS ID',
+          operationId: 'idToUUID',
+          parameters: [
+            {
+              name: 'gts_id',
+              in: 'query',
+              required: true,
+              description: 'GTS ID to derive the UUID from',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'UUID result',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/validate-instance': {
+        post: {
+          summary: 'Validate a registered instance against its type schema',
+          operationId: 'validateInstance',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: { instance_id: { type: 'string' } },
+                  required: ['instance_id'],
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Validation result',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/ValidationResult' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/resolve-relationships': {
+        get: {
+          summary: 'Resolve the relationships declared by an entity',
+          operationId: 'resolveRelationships',
+          parameters: [
+            {
+              name: 'gts_id',
+              in: 'query',
+              required: true,
+              description: 'GTS ID of the entity',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Resolved relationships',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/compatibility': {
+        get: {
+          summary: 'Check compatibility between two type schema versions',
+          operationId: 'checkCompatibility',
+          parameters: [
+            {
+              name: 'old_type_id',
+              in: 'query',
+              required: true,
+              description: 'GTS Type ID of the earlier version',
+              schema: { type: 'string' },
+            },
+            {
+              name: 'new_type_id',
+              in: 'query',
+              required: true,
+              description: 'GTS Type ID of the later version',
+              schema: { type: 'string' },
+            },
+            {
+              name: 'mode',
+              in: 'query',
+              description: 'Compatibility mode',
+              schema: { type: 'string', default: 'full' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Compatibility result',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/cast': {
+        post: {
+          summary: 'Cast a registered instance to another type',
+          operationId: 'cast',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    instance_id: { type: 'string' },
+                    to_type_id: { type: 'string' },
+                  },
+                  required: ['instance_id', 'to_type_id'],
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Cast result',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
                 },
               },
             },
@@ -826,6 +1171,116 @@ export class GtsServer {
           },
         },
       },
+      '/attr': {
+        get: {
+          summary: 'Resolve an attribute path on an entity',
+          operationId: 'getAttribute',
+          parameters: [
+            {
+              name: 'gts_with_path',
+              in: 'query',
+              description: "Combined 'gts_id@path' reference",
+              schema: { type: 'string' },
+            },
+            {
+              name: 'gts_id',
+              in: 'query',
+              description: 'GTS ID of the entity (used together with `path`)',
+              schema: { type: 'string' },
+            },
+            {
+              name: 'path',
+              in: 'query',
+              description: 'Attribute path within the entity (used together with `gts_id`)',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Attribute resolution result',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/validate-type-schema': {
+        post: {
+          summary: "Validate a registered type schema against its parent's constraints",
+          operationId: 'validateTypeSchema',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: { type_id: { type: 'string' } },
+                  required: ['type_id'],
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Validation result',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/ValidationResult' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/validate-entity': {
+        post: {
+          summary: 'Validate a registered entity (schema or instance) uniformly',
+          operationId: 'validateEntity',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    entity_id: { type: 'string' },
+                    gts_id: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Validation result',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/ValidationResult' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/openapi': {
+        get: {
+          summary: 'Get the OpenAPI specification for this server',
+          operationId: 'getOpenAPISpec',
+          responses: {
+            200: {
+              description: 'OpenAPI 3.0 document',
+              content: {
+                'application/json': {
+                  schema: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
     };
   }
 
@@ -836,6 +1291,7 @@ export class GtsServer {
           type: 'object',
           properties: {
             ok: { type: 'boolean' },
+            id: { type: 'string' },
             error: { type: 'string' },
           },
           required: ['ok'],

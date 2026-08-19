@@ -272,17 +272,42 @@ function stripSubschemas(keyword: string, value: any): any {
   }
 }
 
-function isEmptySchema(schema: Schema): boolean {
+export function isEmptySchema(schema: Schema): boolean {
   if (schema === true) return true;
   if (typeof schema !== 'object' || schema === null) return false;
   return Object.keys(stripAnnotations(schema)).length === 0;
 }
 
+/** The JSON-Schema type name(s) a single fixed value implies, by its JS runtime shape. */
+function impliedTypesOf(value: any): string[] {
+  if (value === null) return ['null'];
+  if (Array.isArray(value)) return ['array'];
+  switch (typeof value) {
+    case 'string':
+      return ['string'];
+    case 'boolean':
+      return ['boolean'];
+    case 'number':
+      return Number.isInteger(value) ? ['number', 'integer'] : ['number'];
+    case 'object':
+      return ['object'];
+    default:
+      return [];
+  }
+}
+
 function typeSet(schema: Schema): Set<string> | null {
   if (typeof schema !== 'object' || schema === null) return null;
   const type = schema.type;
-  if (type === undefined) return null;
-  return new Set(Array.isArray(type) ? type : [type]);
+  if (type !== undefined) return new Set(Array.isArray(type) ? type : [type]);
+
+  // No `type` keyword: a `const`/`enum` value set still implies a type - its
+  // values ARE that type - even though the schema never states it literally.
+  const values = fixedValues(schema);
+  if (values === null) return null; // genuinely unconstrained
+  const implied = new Set<string>();
+  for (const v of values) for (const t of impliedTypesOf(v)) implied.add(t);
+  return implied;
 }
 
 /** `number` also accepts every `integer`, so widen the accepting side. */
@@ -525,6 +550,36 @@ function isAtLeastAsStrict(candidate: Bound, reference: Bound, isLower: boolean)
 }
 
 /**
+ * The number a fixed value contributes on a given bound axis: the value
+ * itself for `minimum`/`maximum`, or its `.length` for the length/items axes.
+ * Null when the value's type does not fit the axis (e.g. a string enum member
+ * measured against `minimum`), so the caller can fail closed.
+ */
+function measureForAxis(value: any, axis: BoundAxis): number | null {
+  if (axis.axis === 'minimum' || axis.axis === 'maximum') {
+    return typeof value === 'number' ? value : null;
+  }
+  if (axis.axis === 'minLength' || axis.axis === 'maxLength') {
+    return typeof value === 'string' ? value.length : null;
+  }
+  if (axis.axis === 'minItems' || axis.axis === 'maxItems') {
+    return Array.isArray(value) ? value.length : null;
+  }
+  return null;
+}
+
+/** Whether a measured value satisfies a `(value, exclusive, isLower)` bound. */
+function satisfiesBound(measure: number, bound: Bound, isLower: boolean): boolean {
+  return isLower
+    ? bound.exclusive
+      ? measure > bound.value
+      : measure >= bound.value
+    : bound.exclusive
+      ? measure < bound.value
+      : measure <= bound.value;
+}
+
+/**
  * Describes a lower/upper bound pair that no value can satisfy once every
  * subschema is composed, or null when the bounds are consistent.
  *
@@ -638,7 +693,18 @@ class SubsumptionChecker {
       const outerBound = readBound(outer, axis);
       if (outerBound === null) continue; // outer constrains nothing on this axis
       const innerBound = readBound(inner, axis);
-      if (innerBound === null) return 'incompatible'; // inner is unbounded where outer is not
+      if (innerBound === null) {
+        // Not bounded directly, but a pinned-down value set (`const`/`enum`)
+        // is itself a bound: if every value it admits already satisfies
+        // outer's bound on this axis, inner cannot escape it either.
+        const innerValues = fixedValues(inner);
+        if (innerValues === null || innerValues.length === 0) return 'incompatible';
+        const measures = innerValues.map((v) => measureForAxis(v, axis));
+        if (measures.some((m) => m === null)) return 'incompatible';
+        const allSatisfy = (measures as number[]).every((m) => satisfiesBound(m, outerBound, axis.isLower));
+        if (!allSatisfy) return 'incompatible';
+        continue; // inner is unbounded here, but its fixed values are all within outer's bound
+      }
 
       if (!isAtLeastAsStrict(innerBound, outerBound, axis.isLower)) return 'incompatible';
     }
@@ -712,7 +778,29 @@ class SubsumptionChecker {
     const keys = new Set([...Object.keys(outer), ...Object.keys(inner)]);
     for (const key of keys) {
       if (keywordKind(key) !== 'unmodeled') continue;
-      if (!deepEqual(outer[key], inner[key])) return 'unknown';
+      if (deepEqual(outer[key], inner[key])) continue;
+
+      // `pattern` is otherwise compared by exact equality like any other
+      // unmodeled keyword, but a pinned-down value set (`const`/`enum`) that
+      // already matches outer's pattern satisfies it just as much as
+      // restating the pattern would - mirrors the `compareBounds` fixed-value
+      // carve-out above, scoped narrowly to this one keyword.
+      if (key === 'pattern' && typeof outer.pattern === 'string') {
+        const innerValues = fixedValues(inner);
+        if (innerValues !== null && innerValues.length > 0) {
+          let regex: RegExp | null = null;
+          try {
+            regex = new RegExp(outer.pattern);
+          } catch {
+            regex = null;
+          }
+          if (regex !== null && innerValues.every((v) => typeof v === 'string' && regex!.test(v))) {
+            continue;
+          }
+        }
+      }
+
+      return 'unknown';
     }
 
     return 'compatible';

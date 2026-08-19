@@ -279,6 +279,32 @@ describe('OP#13 - boolean trait schemas (ADR-0002)', () => {
     expect(gts.validateEntity(kidId).ok).toBe(true);
   });
 
+  test('an array-shaped `x-gts-traits-schema` is rejected as malformed', () => {
+    // A JSON Schema subschema must be an object or a boolean; an array is
+    // neither. `typeof [] === 'object'` lets it slip past a naive object
+    // check, and Ajv would otherwise silently treat it as a permissive
+    // object-shaped schema with no recognized keywords.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.arrayschema.v1~';
+
+    gts.register(baseType(baseId, { 'x-gts-traits-schema': [1, 2], 'x-gts-traits': { anything: 'whatever' } }));
+
+    const result = gts.validateEntity(baseId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/x-gts-traits-schema.*must be an object subschema or a boolean/);
+  });
+
+  test('a string-shaped `x-gts-traits-schema` is rejected as malformed too', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.stringschema.v1~';
+
+    gts.register(baseType(baseId, { 'x-gts-traits-schema': 'not-a-schema' }));
+
+    const result = gts.validateEntity(baseId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/x-gts-traits-schema.*must be an object subschema or a boolean/);
+  });
+
   test('trait values with no trait-schema anywhere in the chain are rejected', () => {
     const gts = new GTS({ validateRefs: false });
     const baseId = 'gts.x.unit.tr.noschema.v1~';
@@ -320,7 +346,11 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
 
     gts.register(
       baseType(baseId, {
-        'x-gts-traits-schema': { type: 'object', properties: { retention: { type: 'string' } } },
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['retention'],
+          properties: { retention: { type: 'string' } },
+        },
         'x-gts-abstract': true,
       })
     );
@@ -332,10 +362,44 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     );
 
     // Satisfiability is a property of the composed schema, so the abstract
-    // exemption (which covers completeness only) does not hide it.
+    // exemption (which covers completeness only) does not hide it. The base
+    // branch requires `retention`, so `allOf` semantics make it mandatory
+    // overall even though the descendant branch does not restate `required`.
     const result = gts.validateEntity(kidId);
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/cannot be satisfied/);
+  });
+
+  test('a redeclared trait with a disjoint type is unsatisfiable even though the property is optional in every branch', () => {
+    // Neither branch requires `retention` - but gts-rust's own
+    // `declared_schema`/`check_accepted_set_inclusion` never gates on
+    // required-ness: redeclaring `retention` replaces its base declaration
+    // wholesale, and `Valid(descendant) subset-of Valid(ancestor)` fails once
+    // any instance carrying `retention` as an integer is admitted by the
+    // descendant conjunct but rejected by the ancestor's `string` conjunct.
+    // (An earlier round of this refactor gated this check on required-ness
+    // and asserted `ok: true` here; that gate was an unfaithful divergence
+    // from gts-rust and has been removed - see ADR/session notes.)
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.optconflict.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': { type: 'object', properties: { retention: { type: 'string' } } },
+        'x-gts-abstract': true,
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-traits-schema': { type: 'object', properties: { retention: { type: 'integer' } } },
+        'x-gts-abstract': true,
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/cannot be satisfied|not a valid narrowing/);
   });
 
   test('sibling allOf branches may reference the same trait schema', () => {
@@ -373,6 +437,42 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     gts.register(
       baseType(baseId, {
         'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', required: ['k'], properties: { k: { const: 'a' } } },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { k: { const: 'b' } } },
+      })
+    );
+
+    // The base branch requires `k`, so `allOf` semantics make it mandatory
+    // overall even though the descendant branch does not restate `required`.
+    // The message now comes from the declared-schema accepted-set-inclusion
+    // check (gts-rust's `check_accepted_set_inclusion`, reused here via
+    // `GtsCompatibility.compareSchemas`) rather than the old bespoke
+    // `findValueConflict` walker, so the wording changed from "no value
+    // satisfies" to this check's own "not a valid narrowing" phrasing - the
+    // rejected outcome is unchanged.
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/not a valid narrowing/);
+  });
+
+  test('a crossed const across the chain is unsatisfiable even though the property is optional in every branch', () => {
+    // Neither branch requires `k` - but as with the disjoint-type case above,
+    // gts-rust's accepted-set-inclusion check compares the declared schema of
+    // every property either side declares, regardless of required-ness: the
+    // descendant conjunct's `const: 'b'` is not included in the ancestor
+    // conjunct's `const: 'a'`, so inclusion fails.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.optconstclash.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
         'x-gts-traits-schema': { type: 'object', properties: { k: { const: 'a' } } },
       })
     );
@@ -385,7 +485,6 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
 
     const result = gts.validateEntity(kidId);
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/no value satisfies/);
   });
 
   test('abstract types are not exempt from crossed bounds across the chain', () => {
@@ -396,7 +495,11 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     gts.register(
       baseType(baseId, {
         'x-gts-abstract': true,
-        'x-gts-traits-schema': { type: 'object', properties: { n: { type: 'integer', minimum: 10 } } },
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['n'],
+          properties: { n: { type: 'integer', minimum: 10 } },
+        },
       })
     );
     gts.register(
@@ -451,6 +554,33 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     );
 
     expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+
+  test('a genuine cross-branch bound crossing on a required property is still rejected', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.genuinecrossing.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['score'],
+          properties: { score: { type: 'number', minimum: 60 } },
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { score: { type: 'number', maximum: 50 } } },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/cannot be satisfied/);
   });
 
   test('defaults nested under an object trait are materialized', () => {
@@ -551,14 +681,21 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     expect(gts.validateEntity(baseId).ok).toBe(false);
   });
 
-  test('a closed descendant trait-schema must not orphan an ancestor trait', () => {
+  test('a closed descendant trait-schema must not orphan a required ancestor trait', () => {
+    // `retention` is required on the base branch, so it's guaranteed present
+    // overall - the closed descendant branch that doesn't restate it really
+    // does reject every value, unlike the merely-optional case covered below.
     const gts = new GTS({ validateRefs: false });
     const baseId = 'gts.x.unit.tr.orphan.v1~';
     const kidId = `${baseId}x.unit._.kid.v1~`;
 
     gts.register(
       baseType(baseId, {
-        'x-gts-traits-schema': { type: 'object', properties: { retention: { type: 'string' } } },
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['retention'],
+          properties: { retention: { type: 'string' } },
+        },
         'x-gts-abstract': true,
       })
     );
@@ -599,5 +736,758 @@ describe('OP#13 - the effective trait schema must stay satisfiable', () => {
     );
 
     expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+
+  test('a closed descendant that drops a merely-optional ancestor trait is unsatisfiable', () => {
+    // Intentional semantic flip (this refactor): the closed-branch orphan
+    // check is NOT gated on required-ness, matching gts-rust and this
+    // codebase's own OP#12 `compareOverlayToBase` precedent - an `allOf`
+    // branch is evaluated independently, so a closed branch that never
+    // restates `retention` rejects every value the base branch allows for
+    // it, regardless of whether `retention` happens to be required anywhere.
+    // (Before this refactor, the now-removed `findUnsatisfiableTrait` only
+    // flagged this when the property was `requiredAnywhere`, so this case
+    // used to report `ok: true`.)
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.optorphan.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': { type: 'object', properties: { retention: { type: 'string' } } },
+        'x-gts-abstract': true,
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          additionalProperties: false,
+          properties: { topicRef: { type: 'string' } },
+        },
+        'x-gts-abstract': true,
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(false);
+  });
+
+  test('a conflict between two allOf branches within one trait-schema level is not caught before concretization', () => {
+    // Reflects a genuine, faithfully-ported gts-rust limitation rather than a
+    // bug: `validate_trait_schema_compatibility` (ported here as
+    // `validateTraitChainSatisfiability`'s declared-schema-fold +
+    // accepted-set-inclusion loop) only compares *consecutive chain levels*
+    // (`chain[0..i]` vs `chain[0..i+1]`) - it never inspects a single level's
+    // OWN internal `allOf` composition. `declared_schema`'s own fold of that
+    // single level's branches is last-branch-wins (see `absorbProperty`), so
+    // `branchA`'s `const: 'a'` is silently overwritten by `branchB`'s
+    // `const: 'b'` before any comparison happens, and no chain-level
+    // comparison ever re-examines it. Since this base type is abstract, it
+    // is also exempt from the completeness check (§9.7.5's "descendants
+    // close the gaps"), so the conflict stays latent until some concrete
+    // descendant actually materializes `k` and AJV validates the real,
+    // unfolded `allOf` against it. (An earlier round of this refactor used a
+    // bespoke recursive walker - not part of gts-rust's actual algorithm -
+    // that caught this eagerly and asserted `ok: false` here; per this
+    // session's zero-divergence mandate, that extra check was removed rather
+    // than re-derived, so this scenario is now `ok: true` at the abstract
+    // level, matching gts-rust exactly.)
+    const gts = new GTS({ validateRefs: false });
+    // A GTS id has exactly 4 dot-segments (vendor.package.namespace.type)
+    // before the version - `nestedconflict.a`/`.b` as a 5th segment is
+    // malformed, so the disambiguator is folded into the type token instead.
+    const commonAId = 'gts.x.unit.tr.nestedconflicta.v1~';
+    const commonBId = 'gts.x.unit.tr.nestedconflictb.v1~';
+    const baseId = 'gts.x.unit.tr.nestedconflict.v1~';
+
+    gts.register(baseType(commonAId, { type: 'object', required: ['k'], properties: { k: { const: 'a' } } }));
+    gts.register(baseType(commonBId, { type: 'object', required: ['k'], properties: { k: { const: 'b' } } }));
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          allOf: [{ allOf: [{ $$ref: `gts://${commonAId}` }] }, { allOf: [{ $$ref: `gts://${commonBId}` }] }],
+        },
+      })
+    );
+
+    const result = gts.validateEntity(baseId);
+    expect(result.ok).toBe(true);
+  });
+
+  test('a conflict nested inside an optional property still makes the schema unsatisfiable', () => {
+    // Neither branch requires `x` itself at the outer level - but, as with
+    // the top-level disjoint-type/const cases above, gts-rust's
+    // accepted-set-inclusion check does not gate on required-ness anywhere in
+    // the recursion: it compares the schema declared for every property name
+    // either side declares, at every depth, so `x`'s own optionality does not
+    // shield the `a: string` vs `a: number` conflict nested inside it.
+    // (An earlier round of this refactor asserted `ok: true` here on the
+    // theory that AJV validates `{}` against `allOf: [base, kid]` regardless
+    // of what conflicts exist inside an absent optional property - true for
+    // JSON Schema *instance* validation, but not the question gts-rust's
+    // trait-chain *satisfiability* check answers.)
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.optnested.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            x: {
+              type: 'object',
+              required: ['a'],
+              additionalProperties: false,
+              properties: { a: { type: 'string' } },
+            },
+          },
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            x: { type: 'object', required: ['a'], properties: { a: { type: 'number' } } },
+          },
+        },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+  });
+
+  test('a closed sub-schema nested inside a descendant branch its own allOf still orphans a required ancestor trait', () => {
+    // `retention` is required on the base branch, so it's guaranteed present
+    // overall. The descendant does not close its own top-level branch, but
+    // its own `allOf` nests a closed sub-schema (the shape a `$ref`-to-
+    // reusable-trait-schema produces) that never restates `retention` - that
+    // nested closed node still constrains the very same object instance
+    // once `allOf` is flattened, so it must be caught just like a directly
+    // closed branch would be.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.nestedorphan.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['retention'],
+          properties: { retention: { type: 'string' } },
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          allOf: [{ additionalProperties: false, properties: { topicRef: { type: 'string' } } }],
+        },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    // Wording changed with this refactor's move to `compareOverlayToBase`
+    // (its own closed-branch-orphan message), but the outcome - and the
+    // fact that a *nested* closed branch is still caught - is unchanged.
+    expect(result.error).toMatch(/excluded by additionalProperties: false/);
+  });
+
+  test('a closed branch nested one level inside a shared property still orphans a required ancestor field', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.nestedorphanbug.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['config'],
+          properties: {
+            config: { type: 'object', required: ['field'], properties: { field: { type: 'string' } } },
+          },
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            config: { type: 'object', properties: {}, additionalProperties: false },
+          },
+        },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/excluded by additionalProperties: false/);
+  });
+
+  test('restating the orphaned nested field alongside the closed branch keeps it satisfiable', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.nestedorphanbugrestate.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['config'],
+          properties: {
+            config: { type: 'object', required: ['field'], properties: { field: { type: 'string' } } },
+          },
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            config: {
+              type: 'object',
+              properties: { field: { type: 'string' } },
+              additionalProperties: false,
+            },
+          },
+        },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(true);
+  });
+
+  test('a closed branch two levels deep inside nested property values still orphans a required ancestor field', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.nestedorphanbugdeep.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['config'],
+          properties: {
+            config: {
+              type: 'object',
+              required: ['nested'],
+              properties: {
+                nested: { type: 'object', required: ['field'], properties: { field: { type: 'string' } } },
+              },
+            },
+          },
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            config: {
+              type: 'object',
+              properties: {
+                nested: { type: 'object', properties: {}, additionalProperties: false },
+              },
+            },
+          },
+        },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/excluded by additionalProperties: false/);
+  });
+
+  test('a descendant narrowing an inherited trait keeps the ancestor default', () => {
+    // The base declares `retention`'s `default`; the descendant narrows the
+    // same property with `maxLength` but does not repeat the default. Real
+    // `allOf` semantics combine both branches' constraints on one property,
+    // so the default must still materialize - losing it here would then fail
+    // completeness on a trait the schema itself already answered.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.narrowdefault.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['retention'],
+          properties: { retention: { type: 'string', default: 'p30d' } },
+        },
+        'x-gts-abstract': true,
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-traits-schema': { type: 'object', properties: { retention: { type: 'string', maxLength: 8 } } },
+        'x-gts-abstract': true,
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+
+  test("a descendant's own default overrides the ancestor's default for the same property", () => {
+    // Both the base and the descendant declare a `default` for `retention`.
+    // `allOf` semantics still require a single materialized value, and the
+    // descendant's own declaration is the one that must win - matching the
+    // descendant-overrides-ancestor convention used everywhere else (e.g.
+    // `x-gts-traits`'s RFC 7396 merge). The descendant also constrains the
+    // property with a `maxLength` that only its own (shorter) default value
+    // satisfies, so this is a black-box check: if the ancestor's longer
+    // default won instead, the materialized value would violate `maxLength`
+    // and validation would report an error rather than succeed. (Uses
+    // `maxLength` rather than `pattern`: `pattern` is a JSON Schema
+    // "unmodeled" keyword for `GtsCompatibility.compareSchemas`'s
+    // subsumption engine - introducing one where the ancestor has none makes
+    // that comparison `unknown`, which the satisfiability gate added by this
+    // refactor now fails closed on. `maxLength` is a modeled bound keyword,
+    // so tightening it stays `compatible` and does not trip that gate.)
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.defaultoverride.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['retention'],
+          properties: { retention: { type: 'string', default: 'ANCESTOR-DEFAULT' } },
+        },
+        'x-gts-abstract': true,
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: { retention: { type: 'string', default: 'short', maxLength: 5 } },
+        },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+
+  test("a descendant's own default overrides the ancestor's default one level deeper (nested object property)", () => {
+    // Same conflict as above, but the property carrying the conflicting
+    // defaults (`q`) sits one level under a required object property (`p`),
+    // exercising the fix through `applyTraitDefaults`'s recursion into a
+    // required-but-absent object's subtree defaults. Uses `maxLength` rather
+    // than `pattern` for the same reason as the test above - see its comment.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.nesteddefaultoverride.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['p'],
+          properties: {
+            p: {
+              type: 'object',
+              required: ['q'],
+              properties: { q: { type: 'string', default: 'ANCESTOR-DEFAULT' } },
+            },
+          },
+        },
+        'x-gts-abstract': true,
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: {
+            p: {
+              type: 'object',
+              properties: { q: { type: 'string', default: 'short', maxLength: 5 } },
+            },
+          },
+        },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+});
+
+/**
+ * `validateTraitChainSatisfiability`'s declared-schema-fold +
+ * accepted-set-inclusion check (§9.7.5) is a faithful TS port of gts-rust's
+ * `schema_traits::validate_trait_schema_compatibility`, which in turn calls
+ * `schema_derivation::validate_derivation` - so every fixture below is a
+ * direct 2-level trait-schema-chain translation of a scenario from
+ * gts-rust's own `schema_derivation_test.rs`, with the same expected
+ * pass/fail outcome. `x-gts-abstract: true` on both levels keeps these tests
+ * focused purely on satisfiability, independent of the separate completeness
+ * check (§9.7.5's "descendants close the gaps").
+ */
+describe('OP#13 - trait-chain satisfiability mirrors gts-rust schema_derivation_test.rs', () => {
+  function traitChain(baseId: string, kidId: string, baseProperty: any, kidProperty: any) {
+    return () => {
+      const gts = new GTS({ validateRefs: false });
+      gts.register(
+        baseType(baseId, {
+          'x-gts-abstract': true,
+          'x-gts-traits-schema': { type: 'object', properties: { v: baseProperty } },
+        })
+      );
+      gts.register(
+        derivedType(kidId, baseId, {
+          'x-gts-abstract': true,
+          'x-gts-traits-schema': { type: 'object', properties: { v: kidProperty } },
+        })
+      );
+      return gts.validateEntity(kidId);
+    };
+  }
+
+  test('test_compatible_tightening: a tighter maxLength is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rusttighten.v1~',
+      'gts.x.unit.tr.rusttighten.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 100 },
+      { type: 'string', maxLength: 50 }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_incompatible_loosening_max_length: a looser maxLength is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustloosenmaxlen.v1~',
+      'gts.x.unit.tr.rustloosenmaxlen.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 100 },
+      { type: 'string', maxLength: 200 }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_incompatible_loosening_maximum: a looser maximum is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustloosenmax.v1~',
+      'gts.x.unit.tr.rustloosenmax.v1~x.unit._.kid.v1~',
+      { type: 'integer', maximum: 100 },
+      { type: 'integer', maximum: 200 }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_incompatible_loosening_minimum: a looser minimum is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustloosenmin.v1~',
+      'gts.x.unit.tr.rustloosenmin.v1~x.unit._.kid.v1~',
+      { type: 'integer', minimum: 10 },
+      { type: 'integer', minimum: 5 }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_enum_expansion_fails: widening an enum is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustenumwiden.v1~',
+      'gts.x.unit.tr.rustenumwiden.v1~x.unit._.kid.v1~',
+      { type: 'string', enum: ['a', 'b'] },
+      { type: 'string', enum: ['a', 'b', 'c'] }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_enum_subset_ok: narrowing to an enum subset is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustenumsubset.v1~',
+      'gts.x.unit.tr.rustenumsubset.v1~x.unit._.kid.v1~',
+      { type: 'string', enum: ['a', 'b', 'c'] },
+      { type: 'string', enum: ['a'] }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_omitting_bounds_without_enum_or_const_still_fails: dropping a bound with no replacement is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustdropbound.v1~',
+      'gts.x.unit.tr.rustdropbound.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 100 },
+      { type: 'string' }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_enum_tightening_allows_omitting_bounds: an enum within the inherited maxLength is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustenumtighten.v1~',
+      'gts.x.unit.tr.rustenumtighten.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 100 },
+      { type: 'string', enum: ['gold', 'platinum'] }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  // Direct translation of gts-rust's `test_const_tightening_allows_omitting_
+  // bounds_and_pattern`: the base declares both `maxLength` and `pattern`,
+  // the descendant declares only a `const` that already satisfies both -
+  // `compareBounds`'s fixed-value carve-out covers the `maxLength` half,
+  // and `compareUnmodeled`'s `pattern`-specific carve-out covers the
+  // `pattern` half.
+  test('test_const_tightening_allows_omitting_bounds_and_pattern: a const within the inherited maxLength and pattern is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustconsttighten.v1~',
+      'gts.x.unit.tr.rustconsttighten.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 100, pattern: '^[a-z]+$' },
+      { type: 'string', const: 'hello' }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_const_implies_type: a const narrowing a type-only ancestor is satisfiable', () => {
+    // `retention` (via the `v` property) declares no `type`, only `const:
+    // 'P30D'` - whose value IS a string, so it plainly narrows the
+    // ancestor's `type: 'string'` even though the descendant never restates
+    // `type` literally.
+    const validate = traitChain(
+      'gts.x.unit.tr.constimpliestype.v1~',
+      'gts.x.unit.tr.constimpliestype.v1~x.unit._.kid.v1~',
+      { type: 'string' },
+      { const: 'P30D' }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_enum_implies_type: an enum narrowing a type-only ancestor is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.enumimpliestype.v1~',
+      'gts.x.unit.tr.enumimpliestype.v1~x.unit._.kid.v1~',
+      { type: 'string' },
+      { enum: ['a', 'b'] }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_const_implied_type_conflict_still_fails: a const of the wrong runtime type is not a valid narrowing', () => {
+    // Negative control: 42 is a number, not a string, so this is a genuine
+    // type conflict - the fix must derive the const's own implied type
+    // rather than unconditionally accepting any const/enum as compatible.
+    const validate = traitChain(
+      'gts.x.unit.tr.constimpliedtypeconflict.v1~',
+      'gts.x.unit.tr.constimpliedtypeconflict.v1~x.unit._.kid.v1~',
+      { type: 'string' },
+      { const: 42 }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_const_tightening_violates_pattern_still_fails: a const that does not match the inherited pattern is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustconsttightenbadpattern.v1~',
+      'gts.x.unit.tr.rustconsttightenbadpattern.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 100, pattern: '^[a-z]+$' },
+      { type: 'string', const: 'HELLO' }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_enum_tightening_allows_omitting_pattern: an enum whose members all match the inherited pattern is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustenumtightenpattern.v1~',
+      'gts.x.unit.tr.rustenumtightenpattern.v1~x.unit._.kid.v1~',
+      { type: 'string', pattern: '^[a-z]+$' },
+      { type: 'string', enum: ['gold', 'platinum'] }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_enum_tightening_allows_omitting_numeric_bounds: an enum within the inherited minimum/maximum is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustenumtightennum.v1~',
+      'gts.x.unit.tr.rustenumtightennum.v1~x.unit._.kid.v1~',
+      { type: 'integer', minimum: 0, maximum: 100 },
+      { type: 'integer', enum: [1, 5, 10] }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_enum_tightening_still_rejects_out_of_bound_values: an enum with a member outside the inherited maxLength is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustenumtightenviolate.v1~',
+      'gts.x.unit.tr.rustenumtightenviolate.v1~x.unit._.kid.v1~',
+      { type: 'string', maxLength: 5 },
+      { type: 'string', enum: ['short', 'way-too-long-value'] }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_derived_const_must_be_in_base_enum: a const inside the base enum is satisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustconstinenum.v1~',
+      'gts.x.unit.tr.rustconstinenum.v1~x.unit._.kid.v1~',
+      { type: 'string', enum: ['active', 'inactive'] },
+      { type: 'string', const: 'active' }
+    );
+    expect(validate().ok).toBe(true);
+  });
+
+  test('test_derived_const_must_be_in_base_enum: a const outside the base enum is unsatisfiable', () => {
+    const validate = traitChain(
+      'gts.x.unit.tr.rustconstnotinenum.v1~',
+      'gts.x.unit.tr.rustconstnotinenum.v1~x.unit._.kid.v1~',
+      { type: 'string', enum: ['active', 'inactive'] },
+      { type: 'string', const: 'deleted' }
+    );
+    expect(validate().ok).toBe(false);
+  });
+
+  test('test_property_disabled_fails: disabling an ancestor-declared property is unsatisfiable', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.rustdisableprop.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { x: { type: 'string' } } },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': { type: 'object', properties: { x: false } },
+      })
+    );
+
+    const result = gts.validateEntity(kidId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/disables a property/);
+  });
+
+  test('test_additional_properties_false_blocks_new_prop: a closed ancestor rejects a new descendant property', () => {
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.rustapclosednew.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: { a: { type: 'string' } },
+          additionalProperties: false,
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: { a: { type: 'string' }, b: { type: 'string' } },
+        },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(false);
+  });
+
+  test('test_additional_properties_inherited_via_allof_not_loosening: omitting additionalProperties inherits ancestor closedness', () => {
+    // The descendant conjunct omits `additionalProperties` entirely (rather
+    // than explicitly declaring it `true`), so `mergeAdditionalPropertiesConstraint`
+    // folds forward the ancestor's closed constraint rather than reopening
+    // it - not loosening.
+    const gts = new GTS({ validateRefs: false });
+    const baseId = 'gts.x.unit.tr.rustapinherited.v1~';
+    const kidId = `${baseId}x.unit._.kid.v1~`;
+
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: { a: { type: 'string' } },
+          additionalProperties: false,
+        },
+      })
+    );
+    gts.register(
+      derivedType(kidId, baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          properties: { a: { type: 'string' } },
+        },
+      })
+    );
+
+    expect(gts.validateEntity(kidId).ok).toBe(true);
+  });
+
+  test('a malformed base id no longer hides the ancestor chain and silently passes trait validation (regression)', () => {
+    // Regression for the `buildSchemaChain` fail-open bug: a malformed base
+    // id (5 dot-segments before `v1~` instead of the required 4) used to
+    // make `buildSchemaChain` throw internally and get caught by a bare
+    // `catch { return [schemaId] }`, silently truncating the chain to a
+    // single element with no ancestors - so every trait-schema/parent
+    // constraint on the (now-invisible) base type was skipped and
+    // `validateEntity` wrongly reported `ok: true`. `register()` now rejects
+    // the malformed id outright, so the entity never enters the store.
+    const gts = new GTS({ validateRefs: false });
+    const malformedBaseId = 'gts.x.unit.tr.nestedorphanbug.base.v1~';
+
+    const traitsSchema = {
+      type: 'object',
+      required: ['config'],
+      properties: {
+        config: {
+          type: 'object',
+          required: ['field'],
+          properties: { field: { type: 'string' } },
+        },
+      },
+    };
+    const kidTraitsSchema = {
+      type: 'object',
+      properties: { config: { type: 'object', properties: {}, additionalProperties: false } },
+    };
+
+    expect(() =>
+      gts.register(baseType(malformedBaseId, { 'x-gts-abstract': true, 'x-gts-traits-schema': traitsSchema }))
+    ).toThrow(`Invalid GTS entity id: '${malformedBaseId}'`);
+
+    // The identical trait-schema content, on a well-formed 4-segment base id,
+    // correctly detects the same nested conflict and returns `ok: false` -
+    // confirming the fix only closes the id-well-formedness hole and does
+    // not affect the underlying nested-orphan detection logic itself.
+    const wellFormedBaseId = 'gts.x.unit.tr.nestedorphanbug.v1~';
+    const wellFormedKidId = `${wellFormedBaseId}x.unit._.kid.v1~`;
+
+    gts.register(baseType(wellFormedBaseId, { 'x-gts-abstract': true, 'x-gts-traits-schema': traitsSchema }));
+    gts.register(
+      derivedType(wellFormedKidId, wellFormedBaseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': kidTraitsSchema,
+      })
+    );
+
+    expect(gts.validateEntity(wellFormedKidId).ok).toBe(false);
   });
 });
