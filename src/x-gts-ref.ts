@@ -14,9 +14,16 @@ export interface XGtsRefValidationError {
 }
 
 export class XGtsRefValidator {
-  private store: EntityLookup;
+  private store: EntityLookup | undefined;
 
-  constructor(store: EntityLookup) {
+  /**
+   * @param store Entity registry used to check that referenced GTS IDs actually
+   *   exist. Omit it (or pass `undefined`) to validate only the GTS-ID
+   *   format/pattern of referenced values without requiring the referenced
+   *   entity to be registered - e.g. for `x-gts-traits` values, which are
+   *   schema-level example/default data rather than live references.
+   */
+  constructor(store?: EntityLookup) {
     this.store = store;
   }
 
@@ -334,7 +341,9 @@ export class XGtsRefValidator {
       };
     }
 
-    // Optionally check if entity exists in store
+    // Check if entity exists in store, when a store was provided. Callers
+    // that only need format/pattern validation (no existence requirement)
+    // construct this validator without a store.
     if (this.store) {
       const entity = this.store.get(value);
       if (!entity) {

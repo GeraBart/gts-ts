@@ -538,6 +538,86 @@ describe('OP#8 - unresolvable references fail closed', () => {
 
     expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
   });
+
+  test('a local $ref nested under `properties`, reached via a shared $defs entry, is not silently skipped', () => {
+    // Both documents are byte-identical once `$defs` is stripped (both use
+    // the exact same `properties: { x: { $ref: '#/$defs/T' } }`), so the
+    // `deepEqual` fast path in `subsumes()` must not be allowed to fire
+    // before the local ref nested under `properties.x` - whose target
+    // genuinely differs between the two schemas - is accounted for.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.localref.nested.v1.0~';
+    const newId = 'gts.x.unit.localref.nested.v1.1~';
+
+    gts.register({
+      $$id: oldId,
+      $$schema: DRAFT7,
+      type: 'object',
+      $defs: { T: { type: 'string' } },
+      properties: { x: { $ref: '#/$defs/T' } },
+    });
+    gts.register({
+      $$id: newId,
+      $$schema: DRAFT7,
+      type: 'object',
+      $defs: { T: { type: 'number' } },
+      properties: { x: { $ref: '#/$defs/T' } },
+    });
+
+    const result = gts.checkCompatibility(oldId, newId);
+    expect(result.backward_compatibility).toBe('unknown');
+    expect(result.forward_compatibility).toBe('unknown');
+  });
+
+  test('a genuinely ref-free, identical schema still takes the deepEqual fast path', () => {
+    // Regression guard for the fix above: schemas with no local `$ref`
+    // anywhere must still be recognised as trivially compatible.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.norefidentical.t.v1.0~';
+    const newId = 'gts.x.unit.norefidentical.t.v1.1~';
+    const body = { type: 'object', properties: { x: { type: 'string' } } };
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, ...body });
+    gts.register({ $$id: newId, $$schema: DRAFT7, ...body });
+
+    const result = gts.checkCompatibility(oldId, newId);
+    expect(result.backward_compatibility).toBe('compatible');
+    expect(result.forward_compatibility).toBe('compatible');
+  });
+});
+
+describe('OP#8 - $defs content is documentation, never compared', () => {
+  test('malformed content inside $defs does not force an otherwise-comparable pair to unknown', () => {
+    // `$defs` is annotation-kind (stripped before comparison), so a malformed
+    // value inside it - a number where a schema/boolean belongs - must not
+    // make an otherwise identical, otherwise well-formed comparison
+    // inconclusive: the engine never reads that content for the verdict.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.defsmalformed.t.v1.0~';
+    const newId = 'gts.x.unit.defsmalformed.t.v1.1~';
+    const body = { type: 'object', $defs: { Note: 1 }, properties: { a: { type: 'string' } } };
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, ...body });
+    gts.register({ $$id: newId, $$schema: DRAFT7, ...body });
+
+    const result = gts.checkCompatibility(oldId, newId);
+    expect(result.backward_compatibility).toBe('compatible');
+    expect(result.forward_compatibility).toBe('compatible');
+  });
+
+  test('a genuinely malformed keyword in a compared position still forces unknown', () => {
+    // Narrow-scope guard: the annotation skip in `hasMalformedKeyword` must
+    // only cover annotation-kind keywords like `$defs`; a malformed value in
+    // a real, compared position (`properties`) must still degrade to unknown.
+    const gts = new GTS({ validateRefs: false });
+    const oldId = 'gts.x.unit.propsmalformed.t.v1.0~';
+    const newId = 'gts.x.unit.propsmalformed.t.v1.1~';
+
+    gts.register({ $$id: oldId, $$schema: DRAFT7, type: 'object', properties: { a: 'not-a-schema' } });
+    gts.register({ $$id: newId, $$schema: DRAFT7, type: 'object', properties: { a: { type: 'string' } } });
+
+    expect(gts.checkCompatibility(oldId, newId).full_compatibility).toBe('unknown');
+  });
 });
 
 describe('OP#8 - contradictory allOf branches are unsatisfiable', () => {
@@ -786,5 +866,120 @@ describe('OP#8 - identifiers and reference resolution', () => {
     // The verdict follows the effective resolved schemas, not the identifiers.
     expect(result.backward_compatibility).toBe('compatible');
     expect(result.forward_compatibility).toBe('incompatible');
+  });
+});
+
+describe('OP#8 - SchemaResolver.resolve() is bounded by a path-count budget', () => {
+  // `SchemaResolver.resolve()` does not cache resolved `$ref` targets across
+  // sibling `allOf` branches: a diamond ancestor reached through more than
+  // one path is re-resolved from scratch every time (caching by target id is
+  // unsound here - the same ancestor can legitimately be reached at
+  // different depths, and `resolve()`'s own `MAX_SCHEMA_DEPTH` bailout must
+  // be evaluated fresh at each). Without a cache, a diamond-shaped `allOf`/
+  // `$ref` graph makes `resolve()` itself - independent of anything
+  // downstream - cost time exponential in the number of root-to-leaf paths
+  // through it. `resolve()` counts every `$ref` follow and `allOf` branch
+  // recursion against the same shared `MAX_SCHEMA_PATHS` budget (10,000)
+  // `resolveTraitSchemaRefs` uses, and bails out the same way this class
+  // already bails out on `MAX_SCHEMA_DEPTH`: marking the affected branch
+  // unresolved so the verdict fails closed (`unknown`, or an already-
+  // conservative `incompatible`), never returning a false `compatible`.
+
+  const baseType = (id: string, extra: Record<string, unknown> = {}) => ({
+    $$id: id,
+    $$schema: DRAFT7,
+    type: 'object',
+    required: ['id'],
+    properties: { id: { type: 'string' } },
+    ...extra,
+  });
+
+  test('a chain where every level doubles its composition paths is rejected fast, not with a multi-second/OOM resolve', () => {
+    // Each level's `allOf` is `[{$$ref: prev}, {$$ref: prev}]` - the same
+    // ancestor referenced twice - so composition paths double exactly once
+    // per level. 12 levels alone (2^12 = 4096 branch points, each also
+    // following a `$ref`) already clears the 10,000-path budget, so this
+    // stays small and fast even though, pre-fix, this exact shape measured
+    // in the tens of seconds by 30 levels.
+    const gts = new GTS({ validateRefs: false });
+
+    const prev = 'gts.x.unit.compatpathbudget.a0.v1~';
+    gts.register(baseType(prev));
+
+    const DEPTH = 12;
+    let cur = prev;
+    for (let i = 1; i <= DEPTH; i++) {
+      const next = `gts.x.unit.compatpathbudget.a${i}.v1~`;
+      gts.register(baseType(next, { allOf: [{ $$ref: `gts://${cur}` }, { $$ref: `gts://${cur}` }] }));
+      cur = next;
+    }
+
+    const start = Date.now();
+    const result = gts.checkCompatibility(cur, cur);
+    const elapsedMs = Date.now() - start;
+
+    // Fail-closed: never a false `compatible` once the budget is exceeded.
+    expect(result.backward_compatibility).not.toBe('compatible');
+    expect(result.forward_compatibility).not.toBe('compatible');
+    // Well under a second - this must fail fast, not hang.
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  test('a legitimate, well under-budget doubling chain still resolves to a genuine compatible verdict', () => {
+    // Control for the guard above, using the same doubling shape at a depth
+    // (8 levels, 256 paths) nowhere near the 10,000-path budget.
+    const gts = new GTS({ validateRefs: false });
+
+    const prev = 'gts.x.unit.compatpathbudgetok.a0.v1~';
+    gts.register(baseType(prev));
+
+    const DEPTH = 8;
+    let cur = prev;
+    for (let i = 1; i <= DEPTH; i++) {
+      const next = `gts.x.unit.compatpathbudgetok.a${i}.v1~`;
+      gts.register(baseType(next, { allOf: [{ $$ref: `gts://${cur}` }, { $$ref: `gts://${cur}` }] }));
+      cur = next;
+    }
+
+    const start = Date.now();
+    const result = gts.checkCompatibility(cur, cur);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.backward_compatibility).toBe('compatible');
+    expect(result.forward_compatibility).toBe('compatible');
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  test('a legitimate, realistic two-ancestor diamond chain resolves correctly and quickly', () => {
+    // Control using the shape a real derivation hierarchy would actually
+    // take: level i's `allOf` reaches both level i-1 and level i-2. This
+    // grows far more slowly than the doubling shape above (it follows
+    // Fibonacci-rate growth in composition paths, not 2^n), so a
+    // meaningfully large hierarchy (14 levels) still resolves to a genuine
+    // answer well within the path budget.
+    const gts = new GTS({ validateRefs: false });
+
+    const prevA = 'gts.x.unit.compatdiamondok.a0.v1~';
+    const prevB = 'gts.x.unit.compatdiamondok.b0.v1~';
+    gts.register(baseType(prevA, { properties: { id: { type: 'string' }, p0: { type: 'string' } } }));
+    gts.register(baseType(prevB, { properties: { id: { type: 'string' }, q0: { type: 'string' } } }));
+
+    const DEPTH = 14;
+    let a = prevA;
+    let b = prevB;
+    for (let i = 1; i <= DEPTH; i++) {
+      const next = `gts.x.unit.compatdiamondok.a${i}.v1~`;
+      gts.register(baseType(next, { allOf: [{ $$ref: `gts://${a}` }, { $$ref: `gts://${b}` }] }));
+      b = a;
+      a = next;
+    }
+
+    const start = Date.now();
+    const result = gts.checkCompatibility(a, a);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.backward_compatibility).toBe('compatible');
+    expect(result.forward_compatibility).toBe('compatible');
+    expect(elapsedMs).toBeLessThan(500);
   });
 });

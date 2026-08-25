@@ -1,4 +1,11 @@
-import { CompatibilityResult, CompatVerdict, EntityLookup, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH } from './types';
+import {
+  CompatibilityResult,
+  CompatVerdict,
+  EntityLookup,
+  GTS_URI_PREFIX,
+  MAX_SCHEMA_DEPTH,
+  MAX_SCHEMA_PATHS,
+} from './types';
 import { Gts } from './gts';
 
 /**
@@ -168,6 +175,9 @@ function hasMalformedKeyword(schema: Schema, depth = 0): boolean {
 
   return Object.entries(schema).some(([key, value]) => {
     const spec = KEYWORDS[key];
+    // Annotation-kind content (e.g. `$defs`) is never read for comparison, so
+    // its internal shape must not be able to force an inconclusive verdict.
+    if (spec?.kind === 'annotation') return false;
     if (spec?.shape && !spec.shape(value)) return true;
 
     switch (spec?.values) {
@@ -190,6 +200,49 @@ function malformedSubschema(value: unknown, depth: number): boolean {
   if (typeof value === 'boolean') return false;
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return true;
   return hasMalformedKeyword(value, depth + 1);
+}
+
+/**
+ * True when this schema contains a local JSON-pointer `$ref`/`$$ref`
+ * (a string starting with `#`) anywhere reachable through a genuinely
+ * compared position - `properties`, `items`, `allOf`, etc, per `KEYWORDS`'
+ * `values` metadata. `SchemaResolver.lookupRef()` deliberately never follows
+ * local pointers, so a local ref buried under a compared position would
+ * otherwise be dropped silently during resolution and read as "no
+ * constraint" rather than downgrading the verdict to `unknown`.
+ *
+ * Annotation-kind positions (e.g. `$defs` itself) are not walked: their
+ * content is never compared, so a local ref sitting only inside `$defs` is
+ * irrelevant (see `hasMalformedKeyword`'s matching annotation skip above).
+ */
+function hasUnresolvableLocalRef(schema: Schema, depth = 0): boolean {
+  if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) return false;
+  if (depth > MAX_SCHEMA_DEPTH) return false;
+
+  return Object.entries(schema).some(([key, value]) => {
+    if ((key === '$ref' || key === '$$ref') && typeof value === 'string' && value.startsWith('#')) return true;
+
+    const spec = KEYWORDS[key];
+    if (spec?.kind === 'annotation') return false;
+
+    switch (spec?.values) {
+      case 'schema':
+        return Array.isArray(value)
+          ? value.some((v) => hasUnresolvableLocalRef(v, depth + 1))
+          : hasUnresolvableLocalRef(value, depth + 1);
+      case 'schemaList':
+        return Array.isArray(value) && value.some((v) => hasUnresolvableLocalRef(v, depth + 1));
+      case 'schemaMap':
+        return (
+          typeof value === 'object' &&
+          value !== null &&
+          !Array.isArray(value) &&
+          Object.values(value).some((v) => hasUnresolvableLocalRef(v, depth + 1))
+        );
+      default:
+        return false;
+    }
+  });
 }
 
 /** Keywords whose presence means this level says something about object content. */
@@ -470,6 +523,29 @@ function mergeSchemas(a: Schema, b: Schema): Schema {
 class SchemaResolver {
   private unresolved = false;
 
+  // Bounds the total number of `$ref` follows and `allOf` branch recursions
+  // this resolver may take across its whole lifetime (one top-level
+  // `subsumes()` call and every nested comparison made through it), on top
+  // of `MAX_SCHEMA_DEPTH`'s per-chain-depth bound. A diamond-shaped `allOf`/
+  // `$ref` DAG (level N reaching both level N-1 and N-2, which themselves
+  // both reach a shared ancestor) revisits the same ref from multiple
+  // sibling branches; with no cross-branch cache (see the removed
+  // `resolvedRefCache` - caching resolved ref content by id is unsound here,
+  // since a diamond ancestor can legitimately be reached at different
+  // depths and `resolve()`'s own depth-based bailout must be evaluated
+  // fresh each time), each revisit re-resolves the entire subtree beneath
+  // it, compounding multiplicatively per level. Counted the same way as
+  // `resolveTraitSchemaRefs`'s budget in `store.ts` and bailing out the same
+  // way this class already bails out on `MAX_SCHEMA_DEPTH` - marking the
+  // affected branch unresolved, which `finalize()` downgrades to `unknown`
+  // - rather than throwing: nothing upstream of `compareSchemas()` (e.g.
+  // `validateTraitChainSatisfiability` in `store.ts`) currently catches an
+  // exception from this path, and an inconclusive verdict is this class's
+  // own established convention for "part of the schema could not be
+  // resolved" (see the depth bailout just below and this class's doc
+  // comment).
+  private pathCount = 0;
+
   constructor(private store: EntityLookup) {}
 
   /** True when any `$ref` encountered so far could not be resolved. */
@@ -488,13 +564,18 @@ class SchemaResolver {
       this.unresolved = true;
       return {};
     }
+    if (this.pathCount > MAX_SCHEMA_PATHS) {
+      this.unresolved = true;
+      return {};
+    }
 
     const { allOf, $ref, $$ref, ...rest } = schema as Record<string, any>;
     let effective: Schema = rest;
 
     const ref = $ref || $$ref;
     if (typeof ref === 'string') {
-      const target = this.lookupRef(ref);
+      this.pathCount++;
+      const target = this.pathCount > MAX_SCHEMA_PATHS ? null : this.lookupRef(ref);
       if (target === null) {
         this.unresolved = true;
       } else {
@@ -504,6 +585,11 @@ class SchemaResolver {
 
     if (Array.isArray(allOf)) {
       for (const branch of allOf) {
+        this.pathCount++;
+        if (this.pathCount > MAX_SCHEMA_PATHS) {
+          this.unresolved = true;
+          break;
+        }
         effective = mergeSchemas(effective, this.resolve(branch, depth + 1));
       }
     }
@@ -642,6 +728,13 @@ class SubsumptionChecker {
     // Checked on the raw documents: `resolve()` drops `allOf` / `$ref`, so a
     // malformed composition keyword would be invisible afterwards.
     if (hasMalformedKeyword(outerRaw) || hasMalformedKeyword(innerRaw)) return 'unknown';
+
+    // A local `$ref`/`$$ref` in a compared position is never followed by the
+    // resolver (see `lookupRef`), so it must downgrade the verdict here,
+    // before the `deepEqual` fast-path below can return `compatible` on the
+    // strength of two schemas that normalize identically once `$defs` -
+    // where the ref's actual target content lives - is stripped away.
+    if (hasUnresolvableLocalRef(outerRaw) || hasUnresolvableLocalRef(innerRaw)) return 'unknown';
 
     const outer = this.resolver.resolve(outerRaw, depth);
     const inner = this.resolver.resolve(innerRaw, depth);

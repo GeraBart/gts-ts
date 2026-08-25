@@ -1,5 +1,5 @@
 import Ajv from 'ajv';
-import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH } from './types';
+import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH, MAX_SCHEMA_PATHS } from './types';
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';
 import { XGtsRefValidator } from './x-gts-ref';
@@ -427,69 +427,6 @@ export class GtsStore {
     return (s.startsWith('http://') || s.startsWith('https://')) && s.includes('json-schema.org');
   }
 
-  private flattenSchema(schema: any, depth: number = 0): any {
-    const result: any = {
-      properties: {},
-      required: [],
-    };
-
-    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) return result;
-
-    // Follow a GTS reference. Derived types are `allOf: [{$ref: parent}, …]` by
-    // construction, so without this the parent's properties, `required` and
-    // defaults are invisible to everything built on the flattened view.
-    const ref = schema['$$ref'] || schema['$ref'];
-    if (typeof ref === 'string') {
-      const refId = ref.startsWith(GTS_URI_PREFIX) ? ref.substring(GTS_URI_PREFIX.length) : ref;
-      const refEntity = this.get(refId);
-      if (refEntity && refEntity.isSchema && refEntity.content) {
-        const resolved = this.flattenSchema(refEntity.content, depth + 1);
-        Object.assign(result.properties, resolved.properties || {});
-        result.required.push(...(resolved.required || []));
-        if (resolved.additionalProperties !== undefined) {
-          result.additionalProperties = resolved.additionalProperties;
-        }
-      }
-    }
-
-    // Merge allOf schemas
-    if (schema.allOf && Array.isArray(schema.allOf)) {
-      for (const subSchema of schema.allOf) {
-        const flattened = this.flattenSchema(subSchema, depth + 1);
-
-        // Merge properties
-        Object.assign(result.properties, flattened.properties || {});
-
-        // Merge required
-        if (flattened.required && Array.isArray(flattened.required)) {
-          result.required.push(...flattened.required);
-        }
-
-        // Preserve additionalProperties
-        if (flattened.additionalProperties !== undefined) {
-          result.additionalProperties = flattened.additionalProperties;
-        }
-      }
-    }
-
-    // Add direct properties
-    if (schema.properties) {
-      Object.assign(result.properties, schema.properties);
-    }
-
-    // Add direct required
-    if (schema.required && Array.isArray(schema.required)) {
-      result.required.push(...schema.required);
-    }
-
-    // Top level additionalProperties overrides
-    if (schema.additionalProperties !== undefined) {
-      result.additionalProperties = schema.additionalProperties;
-    }
-
-    return result;
-  }
-
   castInstance(instanceId: string, toSchemaId: string): any {
     try {
       // Get instance entity
@@ -600,8 +537,11 @@ export class GtsStore {
     fromSchemaContent: any,
     toSchemaContent: any
   ): any {
-    // Flatten target schema to merge allOf
-    const targetSchema = this.flattenSchema(toSchemaContent);
+    // Flatten target schema to merge allOf. `resolveSchemaFully` is the
+    // visited-set-protected implementation already used elsewhere in this
+    // file; reusing it here avoids a third divergent "flatten a schema" copy
+    // and its exponential blowup on diamond-shaped multi-parent hierarchies.
+    const targetSchema = this.resolveSchemaFully(toSchemaContent);
 
     // Determine direction
     // The direction is a property of the two type schemas. Deriving it from
@@ -1116,6 +1056,22 @@ export class GtsStore {
       };
     }
 
+    // `x-gts-ref` is an assertion keyword (§9.6) that plain Ajv validation
+    // ignores, so materialized trait values must also be checked against it
+    // explicitly - mirroring the same check applied to cast results above.
+    // Unlike that check, no store is passed here: trait values are
+    // schema-level example/default data documenting a type's shape, not live
+    // references that must already be registered, so only GTS-ID
+    // pattern/format validity is enforced - not registry existence.
+    const xGtsRefErrors = new XGtsRefValidator().validateInstance(materialized, effectiveSchema);
+    if (xGtsRefErrors.length > 0) {
+      return {
+        id: schemaId,
+        ok: false,
+        error: `x-gts-ref validation failed: ${xGtsRefErrors.map((err) => err.reason).join('; ')}`,
+      };
+    }
+
     return { id: schemaId, ok: true, error: '' };
   }
 
@@ -1607,7 +1563,29 @@ export class GtsStore {
   }
 
   // Resolve $ref inside a trait schema, detecting cycles
-  private resolveTraitSchemaRefs(schema: any, visited: Set<string>, depth: number = 0): any {
+  //
+  // `pathBudget` bounds the total number of `$ref` follows and `allOf` branch
+  // recursions taken across the whole top-level call, not just the depth of
+  // any one chain. `MAX_SCHEMA_DEPTH` alone only bounds how deep a single
+  // chain can go; it does nothing to stop a diamond-shaped `allOf`/`$ref`
+  // DAG (level N reaching both level N-1 and N-2, which themselves both
+  // reach a shared ancestor) from being walked once per root-to-leaf path
+  // through it - a count that doubles per level and can reach the millions
+  // within `MAX_SCHEMA_DEPTH`. This function's own tree-walk is cheap even
+  // at that path count (well under a second - see the shared MAX_SCHEMA_PATHS'
+  // budget below), but the resulting *inlined* schema handed to Ajv is not:
+  // Ajv's compiled validator has one function-call node per occurrence, so
+  // validating even a single instance against it becomes exponential too.
+  // A mutable holder (rather than a primitive `count`) is used so every
+  // recursive call increments the SAME counter, matching how `visited` is
+  // threaded per-path but in the opposite sense - shared across all paths,
+  // not cloned per branch.
+  private resolveTraitSchemaRefs(
+    schema: any,
+    visited: Set<string>,
+    depth: number = 0,
+    pathBudget: { count: number } = { count: 0 }
+  ): any {
     // Returning the unresolved schema would silently drop the constraints
     // behind the remaining refs, so the caller is told instead.
     if (depth > MAX_SCHEMA_DEPTH) {
@@ -1629,11 +1607,23 @@ export class GtsStore {
           throw new Error(`Cyclic reference detected in trait schema: ${refId}`);
         }
 
+        pathBudget.count++;
+        if (pathBudget.count > MAX_SCHEMA_PATHS) {
+          throw new Error(
+            `x-gts-traits-schema reference graph has too many composition paths (exceeds ${MAX_SCHEMA_PATHS}) and cannot be resolved`
+          );
+        }
+
         const refEntity = this.get(refId);
         if (!refEntity || !refEntity.content) {
           throw new Error(`Unresolvable trait schema reference: ${refUri}`);
         }
-        const resolved = this.resolveTraitSchemaRefs(refEntity.content, new Set(visited).add(refId), depth + 1);
+        const resolved = this.resolveTraitSchemaRefs(
+          refEntity.content,
+          new Set(visited).add(refId),
+          depth + 1,
+          pathBudget
+        );
         // Merge resolved content into result
         for (const [rk, rv] of Object.entries(resolved)) {
           if (rk !== '$id' && rk !== '$$id' && rk !== '$schema' && rk !== '$$schema') {
@@ -1645,9 +1635,17 @@ export class GtsStore {
 
       if (key === 'allOf' && Array.isArray(value)) {
         // Each branch gets its own path, so sibling branches may reuse a ref.
-        result.allOf = (value as any[]).map((item) => this.resolveTraitSchemaRefs(item, new Set(visited), depth + 1));
+        result.allOf = (value as any[]).map((item) => {
+          pathBudget.count++;
+          if (pathBudget.count > MAX_SCHEMA_PATHS) {
+            throw new Error(
+              `x-gts-traits-schema reference graph has too many composition paths (exceeds ${MAX_SCHEMA_PATHS}) and cannot be resolved`
+            );
+          }
+          return this.resolveTraitSchemaRefs(item, new Set(visited), depth + 1, pathBudget);
+        });
       } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        result[key] = this.resolveTraitSchemaRefs(value, new Set(visited), depth + 1);
+        result[key] = this.resolveTraitSchemaRefs(value, new Set(visited), depth + 1, pathBudget);
       } else {
         result[key] = value;
       }

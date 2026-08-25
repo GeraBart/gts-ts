@@ -1491,3 +1491,226 @@ describe('OP#13 - trait-chain satisfiability mirrors gts-rust schema_derivation_
     expect(gts.validateEntity(wellFormedKidId).ok).toBe(false);
   });
 });
+
+describe('OP#13 - a diamond-shaped x-gts-traits-schema chain is bounded by a path-count budget', () => {
+  // `resolveTraitSchemaRefs` does not memoize `$ref` resolution across
+  // sibling `allOf` branches (a diamond ancestor is re-resolved from scratch
+  // every time a different path reaches it): a schema compiler like Ajv
+  // walks the resulting inlined schema by structure, not by object identity,
+  // so even a memoized-but-still-inlined tree would still be exponential to
+  // compile and, worse, exponential for Ajv's *compiled validator* to run on
+  // every subsequent `validateEntity()` call. Rather than chase that
+  // algorithmic cost, `resolveTraitSchemaRefs` counts every `$ref` follow and
+  // `allOf` branch recursion against a shared, generous `MAX_SCHEMA_PATHS`
+  // budget (10,000) and fails fast and loud once a trait-schema graph has
+  // too many composition paths to be worth resolving - the same "bounded
+  // rejection instead of a full algorithmic fix" already used elsewhere in
+  // this file for `MAX_SCHEMA_DEPTH`.
+
+  test('a chain where every level doubles its composition paths exceeds the budget and fails fast, not with a hang', () => {
+    // Each level's `x-gts-traits-schema` is `{allOf: [{$$ref: prev}, {$$ref:
+    // prev}]}` - the same ancestor referenced twice - so the number of
+    // composition paths doubles exactly once per level. 12 levels already
+    // clears the 10,000-path budget (2^12 = 4096 branch points, each also
+    // following a `$ref`, comfortably exceeds it well before the chain
+    // bottoms out), so this test stays small, fast, and nowhere near a size
+    // that could hang or OOM the test runner even without the guard.
+    const gts = new GTS({ validateRefs: false });
+
+    const prev = 'gts.x.unit.pathbudget.a0.v1~';
+    gts.register(baseType(prev, { 'x-gts-traits-schema': { type: 'object', properties: { p0: { type: 'string' } } } }));
+
+    const DEPTH = 12;
+    let cur = prev;
+    for (let i = 1; i <= DEPTH; i++) {
+      const next = `gts.x.unit.pathbudget.a${i}.v1~`;
+      gts.register(
+        baseType(next, {
+          'x-gts-traits-schema': { allOf: [{ $$ref: `gts://${cur}` }, { $$ref: `gts://${cur}` }] },
+        })
+      );
+      cur = next;
+    }
+
+    const start = Date.now();
+    const result = gts.validateEntity(cur);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/too many composition paths/);
+    expect(result.error).toMatch(/exceeds 10000/);
+    // Well under a second - this must fail fast, not hang.
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  test('a legitimate, shallow (well under-budget) diamond chain still resolves and validates correctly', () => {
+    // Control for the guard above: a modest, realistic diamond - the same
+    // "two immediate ancestors" shape real derivation hierarchies use - must
+    // not be rejected by the new budget.
+    const gts = new GTS({ validateRefs: false });
+
+    const prevA = 'gts.x.unit.pathbudgetok.a0.v1~';
+    const prevB = 'gts.x.unit.pathbudgetok.b0.v1~';
+    gts.register(
+      baseType(prevA, { 'x-gts-traits-schema': { type: 'object', properties: { p0: { type: 'string' } } } })
+    );
+    gts.register(
+      baseType(prevB, { 'x-gts-traits-schema': { type: 'object', properties: { q0: { type: 'string' } } } })
+    );
+
+    const DEPTH = 6;
+    let a = prevA;
+    let b = prevB;
+    for (let i = 1; i <= DEPTH; i++) {
+      const next = `gts.x.unit.pathbudgetok.a${i}.v1~`;
+      gts.register(
+        baseType(next, {
+          allOf: [{ $$ref: `gts://${a}` }, { $$ref: `gts://${b}` }],
+          'x-gts-traits-schema': { allOf: [{ $$ref: `gts://${a}` }, { $$ref: `gts://${b}` }] },
+        })
+      );
+      b = a;
+      a = next;
+    }
+
+    const start = Date.now();
+    const result = gts.validateEntity(a);
+    const elapsedMs = Date.now() - start;
+
+    // No `x-gts-traits` value was supplied, so completeness fails (the base
+    // ancestors' trait properties, and the entity's own `id`, are never
+    // satisfied) - that failure is expected and orthogonal to this test.
+    // What matters is that resolution actually ran to that verdict instead
+    // of being rejected by the path-count budget.
+    expect(result.ok).toBe(false);
+    expect(result.error).not.toMatch(/too many composition paths/);
+    expect(result.error).not.toMatch(/nests deeper than/);
+    expect(elapsedMs).toBeLessThan(500);
+  });
+
+  test('a legitimate, non-branching trait-schema chain resolves correctly and quickly regardless of depth', () => {
+    // Control for the guard's depth-independence: a purely linear chain (no
+    // `allOf` branching at all) never accumulates more than one composition
+    // path per level, so it must sail through the 10,000-path budget
+    // regardless of how deep it goes. Depth is kept within `MAX_SCHEMA_DEPTH`
+    // (64) - `resolveTraitSchemaRefs` recurses through a referenced entity's
+    // whole content (not only its `x-gts-traits-schema`), so its own
+    // depth-per-level cost is a separate, pre-existing property of this
+    // walker, unrelated to (and unchanged by) the path-count budget this
+    // test guards.
+    const gts = new GTS({ validateRefs: false });
+
+    const prev = 'gts.x.unit.linearchain.a0.v1~';
+    gts.register(baseType(prev, { 'x-gts-traits-schema': { type: 'object', properties: { p0: { type: 'string' } } } }));
+
+    const DEPTH = 15;
+    let cur = prev;
+    for (let i = 1; i <= DEPTH; i++) {
+      const next = `gts.x.unit.linearchain.a${i}.v1~`;
+      gts.register(
+        baseType(next, {
+          'x-gts-traits-schema': { allOf: [{ $$ref: `gts://${cur}` }] },
+        })
+      );
+      cur = next;
+    }
+
+    const start = Date.now();
+    const result = gts.validateEntity(cur);
+    const elapsedMs = Date.now() - start;
+
+    expect(result.error).not.toMatch(/too many composition paths/);
+    expect(result.error).not.toMatch(/nests deeper than/);
+    expect(elapsedMs).toBeLessThan(500);
+  });
+});
+
+describe('OP#13 - x-gts-ref is enforced against materialized trait values (§9.6)', () => {
+  test('a materialized trait value that violates x-gts-ref fails completeness', () => {
+    const gts = new GTS({ validateRefs: false });
+    const topicSchemaId = 'gts.x.unit.trxrefbad.topic.v1~';
+    gts.register(baseType(topicSchemaId));
+
+    const baseId = 'gts.x.unit.trxrefbad.base.v1~';
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['topicRef'],
+          properties: { topicRef: { type: 'string', 'x-gts-ref': topicSchemaId } },
+        },
+        'x-gts-traits': { topicRef: 'not-a-valid-gts-ref-at-all' },
+      })
+    );
+
+    const result = gts.validateEntity(baseId);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/x-gts-ref/);
+  });
+
+  test('a materialized trait value that matches x-gts-ref passes completeness', () => {
+    const gts = new GTS({ validateRefs: false });
+    const topicSchemaId = 'gts.x.unit.trxrefgood.topic.v1~';
+    gts.register(baseType(topicSchemaId));
+
+    const baseId = 'gts.x.unit.trxrefgood.base.v1~';
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['topicRef'],
+          properties: { topicRef: { type: 'string', 'x-gts-ref': topicSchemaId } },
+        },
+        // A registered entity id that matches the x-gts-ref pattern is a valid
+        // reference value; the schema's own id qualifies.
+        'x-gts-traits': { topicRef: topicSchemaId },
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(true);
+  });
+
+  test('a materialized trait value matching x-gts-ref passes completeness even when the referenced entity is not registered', () => {
+    const gts = new GTS({ validateRefs: false });
+    // Deliberately never registered: `x-gts-traits` values are schema-level
+    // example/default data documenting a type's shape, not live references
+    // that must already exist in the registry at schema-authoring time.
+    const topicSchemaId = 'gts.x.unit.trxrefunreg.topic.v1~';
+
+    const baseId = 'gts.x.unit.trxrefunreg.base.v1~';
+    gts.register(
+      baseType(baseId, {
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['topicRef'],
+          properties: { topicRef: { type: 'string', 'x-gts-ref': topicSchemaId } },
+        },
+        'x-gts-traits': { topicRef: `${topicSchemaId}x.unit._.orders.v1` },
+      })
+    );
+
+    const result = gts.validateEntity(baseId);
+    expect(result.ok).toBe(true);
+    expect(result.error).toBe('');
+  });
+
+  test('an abstract type with an unresolved x-gts-ref-constrained trait is still exempt', () => {
+    const gts = new GTS({ validateRefs: false });
+    const topicSchemaId = 'gts.x.unit.trxrefabs.topic.v1~';
+    gts.register(baseType(topicSchemaId));
+
+    const baseId = 'gts.x.unit.trxrefabs.base.v1~';
+    gts.register(
+      baseType(baseId, {
+        'x-gts-abstract': true,
+        'x-gts-traits-schema': {
+          type: 'object',
+          required: ['topicRef'],
+          properties: { topicRef: { type: 'string', 'x-gts-ref': topicSchemaId } },
+        },
+      })
+    );
+
+    expect(gts.validateEntity(baseId).ok).toBe(true);
+  });
+});

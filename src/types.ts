@@ -12,6 +12,21 @@ export const MAX_ID_LENGTH = 1024;
  */
 export const MAX_SCHEMA_DEPTH = 64;
 
+/**
+ * Bounds the total number of `$ref` follows and `allOf` branch recursions a
+ * schema walker may take across one top-level call, independent of
+ * `MAX_SCHEMA_DEPTH` (which only bounds how deep a single chain goes, not how
+ * many root-to-leaf paths a diamond-shaped `allOf`/`$ref` DAG can have). Path
+ * count doubles per level in a symmetric diamond, so a modest depth well
+ * inside `MAX_SCHEMA_DEPTH` can already reach millions of paths, which makes
+ * naive per-path resolution/comparison exponential even though depth alone
+ * stays small. 10,000 is generously above any realistic legitimate schema
+ * hierarchy (expected to be a handful of levels deep with little to no
+ * branching) while guaranteeing the walk completes in well under a second
+ * even in the worst case.
+ */
+export const MAX_SCHEMA_PATHS = 10_000;
+
 export interface GtsIDSegment {
   num: number;
   offset: number;

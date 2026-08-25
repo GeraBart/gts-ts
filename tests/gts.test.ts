@@ -570,6 +570,61 @@ describe('GTS Store Operations', () => {
       expect(result.ok).toBe(true);
       expect(result.result).toMatchObject({ name: 'Ann', age: 41, dept: 'unassigned' });
     });
+
+    test('casts to a target whose allOf reaches the same shared ancestor through two branches', () => {
+      // Diamond-shaped hierarchy: `mid` and `sibling` both compose `ancestor`,
+      // and the target composes both `mid` and `sibling`. Flattening the
+      // target must revisit `ancestor` at most once so its property survives
+      // exactly once - not duplicated, not dropped - regardless of how many
+      // paths reach it.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.ancestor.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { shared: { type: 'string', default: 'from-ancestor' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.mid.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.ancestor.v1~' }],
+        properties: { fromMid: { type: 'string', default: 'mid' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.sibling.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.ancestor.v1~' }],
+        properties: { fromSibling: { type: 'string', default: 'sibling' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.diamondtarget.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.mid.v1~' }, { $$ref: 'gts://gts.test.pkg.ns.sibling.v1~' }],
+        properties: { direct: { type: 'string', default: 'direct' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.diamondsource.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: {},
+      });
+      gts.register({ id: 'gts.test.pkg.ns.diamondsource.v1~test.pkg.ns.item.v1.0' });
+
+      const result = gts.castInstance(
+        'gts.test.pkg.ns.diamondsource.v1~test.pkg.ns.item.v1.0',
+        'gts.test.pkg.ns.diamondtarget.v1~'
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.result).toMatchObject({
+        shared: 'from-ancestor',
+        fromMid: 'mid',
+        fromSibling: 'sibling',
+        direct: 'direct',
+      });
+    });
   });
 
   describe('OP#10 - Query Execution', () => {
