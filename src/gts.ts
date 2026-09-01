@@ -213,6 +213,16 @@ export class Gts {
     }
   }
 
+  /**
+   * Whether `value` is a plain UUID (v4/v5-shaped) string - the id form
+   * gts-spec §3.7 permits for an "anonymous instance" (a non-schema entity
+   * identified by a bare UUID, with schema resolution carried by a separate
+   * `type` field rather than by the id's own GTS-chain shape).
+   */
+  static isUuid(value: string): boolean {
+    return UUID_REGEX.test(value);
+  }
+
   static validateGtsID(id: string): ValidationResult {
     const isWildcard = id.includes('*');
     try {
@@ -266,7 +276,16 @@ export class Gts {
 
   static idToUUID(id: string): UUIDResult {
     try {
-      this.parseGtsID(id);
+      const parsed = this.parseGtsID(id);
+
+      // A combined anonymous instance already carries its UUID as the tail
+      // segment; that UUID is the instance identity, so return it as-is rather
+      // than deriving a second one from the string.
+      const lastSegment = parsed.segments[parsed.segments.length - 1];
+      if (lastSegment && lastSegment.isUuidTail) {
+        return { id, uuid: lastSegment.segment };
+      }
+
       return {
         id,
         uuid: this.toUUID(id),
@@ -280,7 +299,21 @@ export class Gts {
     }
   }
 
-  static matchIDPattern(candidate: string, pattern: string): MatchResult {
+  /**
+   * OP#4 - match a candidate identifier against a pattern.
+   *
+   * `chainSuffixMatchesSelf` controls whether a bare chain-suffix wildcard
+   * (`type.v1~*`) also matches the type it is anchored on, rather than only the
+   * identifiers derived from it. Spec §10 states the inclusive reading for
+   * pattern matching, while its collection examples (and OP#10) enumerate only
+   * the strictly-derived identifiers, so OP#10 queries pass `false`.
+   */
+  static matchIDPattern(
+    candidate: string,
+    pattern: string,
+    options?: { chainSuffixMatchesSelf?: boolean }
+  ): MatchResult {
+    const chainSuffixMatchesSelf = options?.chainSuffixMatchesSelf !== false;
     try {
       // Validate and parse candidate
       // If candidate contains '*', validate it as a wildcard pattern first
@@ -315,7 +348,7 @@ export class Gts {
       }
 
       // Perform matching
-      const match = this.wildcardMatch(candidateId, patternId);
+      const match = this.wildcardMatch(candidateId, patternId, chainSuffixMatchesSelf);
 
       return {
         match,
@@ -477,14 +510,14 @@ export class Gts {
     return gtsId;
   }
 
-  private static wildcardMatch(candidate: GtsID, pattern: GtsID): boolean {
+  private static wildcardMatch(candidate: GtsID, pattern: GtsID, chainSuffixMatchesSelf: boolean = true): boolean {
     if (!candidate || !pattern) {
       return false;
     }
 
     // If no wildcard in pattern, perform exact match with version flexibility
     if (!pattern.id.includes('*')) {
-      return this.matchSegments(pattern.segments, candidate.segments);
+      return this.matchSegments(pattern.segments, candidate.segments, chainSuffixMatchesSelf);
     }
 
     // Wildcard case
@@ -493,16 +526,50 @@ export class Gts {
     }
 
     // Use segment matching for wildcard patterns too
-    return this.matchSegments(pattern.segments, candidate.segments);
+    return this.matchSegments(pattern.segments, candidate.segments, chainSuffixMatchesSelf);
   }
 
-  private static matchSegments(patternSegs: GtsIDSegment[], candidateSegs: GtsIDSegment[]): boolean {
+  /**
+   * Reads the major version out of a wildcard pattern segment such as
+   * `x.pkg.ns.type.v0.*`. The parsed segment cannot express this: an omitted
+   * major version and `v0` both leave `verMajor` at 0.
+   *
+   * Only the major version can appear before the wildcard. A minor-qualified
+   * form (`type.v1.2.*`) would be a seven-token segment, which the parser
+   * rejects; the way to select one minor version and its derived types is the
+   * chain-suffix wildcard `type.v1.2~*`.
+   */
+  private static wildcardPatternVersion(segment: string): { majorSpecified: boolean; major: number } {
+    const match = /(?:^|\.)v(\d+)\.\*$/.exec(segment);
+    if (!match) {
+      return { majorSpecified: false, major: 0 };
+    }
+    return { majorSpecified: true, major: parseInt(match[1], 10) };
+  }
+
+  private static matchSegments(
+    patternSegs: GtsIDSegment[],
+    candidateSegs: GtsIDSegment[],
+    chainSuffixMatchesSelf: boolean = true
+  ): boolean {
+    // A bare chain-suffix wildcard (`type.v1~*`) matches everything derived
+    // from the type, and - unless the caller opts out - the type itself, so it
+    // may absorb zero segments.
+    const lastPattern = patternSegs[patternSegs.length - 1];
+    const hasBareTrailingWildcard = !!lastPattern && lastPattern.isWildcard && lastPattern.segment === '*';
+    const requiredSegs = hasBareTrailingWildcard ? patternSegs.length - 1 : patternSegs.length;
+
     // If pattern is longer than candidate, no match
-    if (patternSegs.length > candidateSegs.length) {
+    if (requiredSegs > candidateSegs.length) {
       return false;
     }
 
-    for (let i = 0; i < patternSegs.length; i++) {
+    // Strictly-derived mode: the wildcard must absorb at least one segment.
+    if (hasBareTrailingWildcard && !chainSuffixMatchesSelf && candidateSegs.length <= requiredSegs) {
+      return false;
+    }
+
+    for (let i = 0; i < requiredSegs; i++) {
       const pSeg = patternSegs[i];
       const cSeg = candidateSegs[i];
 
@@ -521,11 +588,10 @@ export class Gts {
         if (pSeg.type && pSeg.type !== cSeg.type) {
           return false;
         }
-        // Check version fields if they are set in the pattern
-        if (pSeg.verMajor !== 0 && pSeg.verMajor !== cSeg.verMajor) {
-          return false;
-        }
-        if (pSeg.verMinor !== undefined && (cSeg.verMinor === undefined || pSeg.verMinor !== cSeg.verMinor)) {
+        // Check the version only when the pattern actually spells one out.
+        // A major-only wildcard matches any minor of that major.
+        const patternVersion = this.wildcardPatternVersion(pSeg.segment);
+        if (patternVersion.majorSpecified && patternVersion.major !== cSeg.verMajor) {
           return false;
         }
         // Check is_type flag if set

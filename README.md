@@ -6,6 +6,8 @@ A complete TypeScript implementation of the Global Type System (GTS)
 
 GTS [Global Type System](https://github.com/globaltypesystem/gts-spec) is a simple, human-readable, globally unique identifier and referencing system for data type definitions (e.g., JSON Schemas) and data instances (e.g., JSON objects). This TypeScript implementation provides type-safe operations for working with GTS identifiers.
 
+**Targets gts-spec [v0.13.1](https://github.com/GlobalTypeSystem/gts-spec/releases/tag/v0.13.1)** — recorded in [`.gts-spec-version`](.gts-spec-version) and pinned by the `.gts-spec` submodule. Run `make update-spec` to check the pinned release out. See the [CHANGELOG](CHANGELOG.md) for the breaking changes in the 0.8 → 0.13 upgrade.
+
 ## Roadmap
 
 Featureset:
@@ -15,16 +17,17 @@ Featureset:
 - [x] **OP#3 - ID Parsing**: Decompose identifiers into constituent parts (vendor, package, namespace, type, version, etc.)
 - [x] **OP#4 - ID Pattern Matching**: Match identifiers against patterns containing wildcards
 - [x] **OP#5 - ID to UUID Mapping**: Generate deterministic UUIDs from GTS identifiers
-- [x] **OP#6 - Instance Validation**: Validate object instances against their corresponding schemas
+- [x] **OP#6 - Instance Validation**: Validate object instances against their corresponding Type Schemas
 - [x] **OP#7 - Relationship Resolution**: Load all schemas and instances, resolve inter-dependencies, and detect broken references
-- [x] **OP#8 - Compatibility Checking**: Verify that schemas with different MINOR versions are compatible
+- [x] **OP#8 - Type Schema Evolution Compatibility Checking**: Compare two definitions of one type identity and report the tri-state verdict (`compatible` / `incompatible` / `unknown`) for each relation
 - [x] **OP#8.1 - Backward compatibility checking**
 - [x] **OP#8.2 - Forward compatibility checking**
 - [x] **OP#8.3 - Full compatibility checking**
-- [x] **OP#9 - Version Casting**: Transform instances between compatible MINOR versions
+- [x] **OP#9 - Version Casting**: Transform an instance to another version of its type. Reported separately from compatibility (§4.3, §4.6.3): a cast succeeds when its result satisfies the target type, not when the two schemas are compatible
 - [x] **OP#10 - Query Execution**: Filter identifier collections using the GTS query language
 - [x] **OP#11 - Attribute Access**: Retrieve property values and metadata using the attribute selector (`@`)
-- [x] **OP#12 - Schema Validation**: Validate schema against its precedent schema
+- [x] **OP#12 - Type Derivation Validation**: Validate that a derived type correctly extends its base chain
+- [x] **OP#13 - Schema Traits Validation**: Validate `x-gts-traits-schema` / `x-gts-traits` across the `$id` chain
 
 Other GTS spec [Reference Implementation](https://github.com/globaltypesystem/gts-spec/blob/main/README.md#9-reference-implementation-recommendations) recommended features support:
 
@@ -32,6 +35,7 @@ Other GTS spec [Reference Implementation](https://github.com/globaltypesystem/gt
 - [x] **CLI** - command-line interface for all GTS operations
 - [x] **Web server** - a non-production web-server with REST API for the operations processing and testing
 - [x] **x-gts-ref** - to support special GTS entity reference annotation in schemas
+- [x] **x-gts-final / x-gts-abstract** - GTS Type Schema modifiers controlling inheritance and instantiation
 - [ ] **YAML support** - to support YAML files (`*.yml`, `*.yaml`) as input files
 - [ ] **TypeSpec support** - add [typespec.io](https://typespec.io/) files (`*.tsp`) support
 - [ ] **UUID for instances** - to support UUID as ID in JSON instances
@@ -65,7 +69,7 @@ const content = {
 
 const extracted = extractID(content);
 console.log(`ID: ${extracted.id}`);
-console.log(`Schema ID: ${extracted.schemaId}`);
+console.log(`Type ID: ${extracted.type_id}`);
 
 // OP#3 - ID Parsing
 const parsed = parseGtsID('gts.vendor.pkg.ns.type.v1~');
@@ -113,11 +117,12 @@ const relationships = gts.resolveRelationships('gts.vendor.pkg.ns.type.v1.0');
 console.log(`Relationships: ${relationships.relationships}`);
 console.log(`Broken references: ${relationships.brokenReferences}`);
 
-// OP#8 - Check compatibility
-const compatResult = gts.checkCompatibility('gts.vendor.pkg.ns.type.v1~', 'gts.vendor.pkg.ns.type.v2~', 'backward');
-if (compatResult.compatible) {
-  console.log('Schemas are compatible');
-}
+// OP#8 - Check Type Schema evolution compatibility
+// Each relation is reported as 'compatible', 'incompatible' or 'unknown'
+const compatResult = gts.checkCompatibility('gts.vendor.pkg.ns.type.v1~', 'gts.vendor.pkg.ns.type.v2~');
+console.log(`backward: ${compatResult.backward_compatibility}`);
+console.log(`forward:  ${compatResult.forward_compatibility}`);
+console.log(`full:     ${compatResult.full_compatibility}`);
 
 // OP#9 - Cast instance to different version
 const castResult = gts.castInstance('gts.vendor.pkg.ns.type.v1.0', 'gts.vendor.pkg.ns.type.v2~');
@@ -215,7 +220,7 @@ npx gts-server --host 127.0.0.1 --port 8000 --verbose 2
 - `GET /entities/:id` - Get specific entity
 - `POST /entities` - Add new entity
 - `POST /entities/bulk` - Add multiple entities
-- `POST /schemas` - Add new schema
+- `POST /type-schemas` - Register a GTS Type Schema under an explicit `type_id`
 
 #### GTS Operations
 
@@ -226,12 +231,12 @@ npx gts-server --host 127.0.0.1 --port 8000 --verbose 2
 - `GET /uuid?id=<gts_id>` - Generate UUID (OP#5)
 - `POST /validate-instance` - Validate instance (OP#6)
 - `GET /resolve-relationships?id=<gts_id>` - Resolve relationships (OP#7)
-- `GET /compatibility?old=<id>&new=<id>&mode=<mode>` - Check compatibility (OP#8)
+- `GET /compatibility?old_type_id=<id>&new_type_id=<id>` - Check Type Schema evolution compatibility (OP#8)
 - `POST /cast` - Cast instance (OP#9)
 - `GET /query?expr=<expression>&limit=<limit>` - Query entities (OP#10)
 - `GET /attr?path=<path>` - Get attribute value (OP#11)
-- `POST /validate-schema` - Validate schema against parent schema (OP#12)
-- `POST /validate-entity` - Validate entity (schema or instance) (OP#12)
+- `POST /validate-type-schema` - Validate a derived Type Schema against its base chain (OP#12)
+- `POST /validate-entity` - Validate entity (type schema or instance) (OP#12/OP#13)
 
 #### Other
 
@@ -247,17 +252,20 @@ curl http://127.0.0.1:8000/health
 # Validate a GTS ID
 curl "http://127.0.0.1:8000/validate-id?id=gts.vendor.pkg.ns.type.v1~"
 
-# Add a schema
-curl -X POST http://127.0.0.1:8000/schemas \
+# Register a GTS Type Schema
+curl -X POST http://127.0.0.1:8000/type-schemas \
   -H "Content-Type: application/json" \
   -d '{
-    "$$id": "gts.test.example.ns.person.v1~",
-    "type": "object",
-    "properties": {
-      "name": { "type": "string" },
-      "age": { "type": "number" }
-    },
-    "required": ["name"]
+    "type_id": "gts.test.example.ns.person.v1~",
+    "type_schema": {
+      "$$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "age": { "type": "number" }
+      },
+      "required": ["name"]
+    }
   }'
 
 # Query entities

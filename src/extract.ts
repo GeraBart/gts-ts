@@ -146,14 +146,10 @@ export class GtsExtractor {
             schemaId = id.substring(0, lastTilde + 1);
             selectedSchemaIdField = selectedEntityField;
           }
-        } else {
-          // Base schema (single segment type or no $id) - use $schema field value
-          const schemaResult = this.findFirstValidField(content, ['$schema', '$$schema']);
-          if (schemaResult) {
-            schemaId = schemaResult.value;
-            selectedSchemaIdField = schemaResult.field;
-          }
         }
+        // A base type schema has no GTS parent type, so type_id stays null.
+        // The JSON Schema dialect URL in $schema is not a GTS Type Identifier
+        // and must never be reported as one.
       } else {
         // For instances (non-schemas):
         // $id without $schema means the doc is an instance, NOT a schema
@@ -204,10 +200,10 @@ export class GtsExtractor {
 
     return {
       id,
-      schema_id: schemaId,
+      type_id: schemaId,
       selected_entity_field: selectedEntityField,
-      selected_schema_id_field: selectedSchemaIdField,
-      is_schema: isSchema,
+      selected_type_id_field: selectedSchemaIdField,
+      is_type_schema: isSchema,
     };
   }
 }

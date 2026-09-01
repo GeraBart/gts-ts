@@ -2,6 +2,31 @@ export const GTS_PREFIX = 'gts.';
 export const GTS_URI_PREFIX = 'gts://';
 export const MAX_ID_LENGTH = 1024;
 
+/**
+ * Recursion bound shared by every walker over schema documents.
+ *
+ * The limit exists to stop pathological or cyclic input, never to decide a
+ * result. Whatever hits it must fail closed - report the finding, or mark the
+ * comparison inconclusive - and must never return a value that reads as
+ * "unconstrained", which would turn a bailout into a silent pass.
+ */
+export const MAX_SCHEMA_DEPTH = 64;
+
+/**
+ * Bounds the total number of `$ref` follows and `allOf` branch recursions a
+ * schema walker may take across one top-level call, independent of
+ * `MAX_SCHEMA_DEPTH` (which only bounds how deep a single chain goes, not how
+ * many root-to-leaf paths a diamond-shaped `allOf`/`$ref` DAG can have). Path
+ * count doubles per level in a symmetric diamond, so a modest depth well
+ * inside `MAX_SCHEMA_DEPTH` can already reach millions of paths, which makes
+ * naive per-path resolution/comparison exponential even though depth alone
+ * stays small. 10,000 is generously above any realistic legitimate schema
+ * hierarchy (expected to be a handful of levels deep with little to no
+ * branching) while guaranteeing the walk completes in well under a second
+ * even in the worst case.
+ */
+export const MAX_SCHEMA_PATHS = 10_000;
+
 export interface GtsIDSegment {
   num: number;
   offset: number;
@@ -34,7 +59,7 @@ export interface ParseResult {
   ok: boolean;
   segments: GtsIDSegment[];
   error?: string;
-  is_schema?: boolean;
+  is_type_schema?: boolean;
   is_wildcard?: boolean;
 }
 
@@ -53,10 +78,10 @@ export interface UUIDResult {
 
 export interface ExtractResult {
   id: string;
-  schema_id: string | null;
+  type_id: string | null;
   selected_entity_field?: string;
-  selected_schema_id_field?: string;
-  is_schema: boolean;
+  selected_type_id_field?: string;
+  is_type_schema: boolean;
   error?: string;
 }
 
@@ -82,14 +107,27 @@ export interface RelationshipResult {
   error?: string;
 }
 
+/** Tri-state compatibility verdict (GTS spec 0.13 §4.3). */
+export type CompatVerdict = 'compatible' | 'incompatible' | 'unknown';
+
 export interface CompatibilityResult {
-  from: string;
-  to: string;
   old: string;
   new: string;
+  backward_compatibility: CompatVerdict;
+  forward_compatibility: CompatVerdict;
+  full_compatibility: CompatVerdict;
+  from: string;
+  to: string;
   direction: string;
+  /**
+   * @deprecated Always empty since 0.4.0. Compatibility is decided by comparing
+   * accepted-instance sets (§4.3) rather than by diffing properties, so the
+   * engine no longer produces a property diff. Slated for removal.
+   */
   added_properties: string[];
+  /** @deprecated Always empty since 0.4.0. See {@link CompatibilityResult.added_properties}. */
   removed_properties: string[];
+  /** @deprecated Always empty since 0.4.0. See {@link CompatibilityResult.added_properties}. */
   changed_properties: Array<Record<string, string>>;
   is_fully_compatible: boolean;
   is_backward_compatible: boolean;
@@ -110,6 +148,19 @@ export interface CastResult {
 export interface GtsConfig {
   validateRefs: boolean;
   strictMode: boolean;
+}
+
+/**
+ * The read-only registry surface that the compatibility engine and the
+ * `x-gts-ref` validator need - entity lookup by identifier, nothing more.
+ *
+ * They depend on this instead of on `GtsStore` so that the dependency stays
+ * one-way: the registry may reach into those modules, and they only need to
+ * look entities up. `GtsStore` satisfies this structurally, so no call site
+ * changes and no import cycle.
+ */
+export interface EntityLookup {
+  get(id: string): JsonEntity | undefined;
 }
 
 export interface JsonEntity {

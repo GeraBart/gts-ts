@@ -1,4 +1,14 @@
-import { GTS, isValidGtsID, validateGtsID, parseGtsID, matchIDPattern, idToUUID, extractID } from '../src';
+import {
+  GTS,
+  GtsStore,
+  createJsonEntity,
+  isValidGtsID,
+  validateGtsID,
+  parseGtsID,
+  matchIDPattern,
+  idToUUID,
+  extractID,
+} from '../src';
 
 describe('GTS Core Operations', () => {
   describe('OP#1 - ID Validation', () => {
@@ -46,7 +56,7 @@ describe('GTS Core Operations', () => {
 
       const result = extractID(instance);
       expect(result.id).toBe('gts.vendor.pkg.ns.type.v1.0');
-      expect(result.is_schema).toBe(false);
+      expect(result.is_type_schema).toBe(false);
     });
 
     test('extracts GTS ID from schema', () => {
@@ -59,7 +69,7 @@ describe('GTS Core Operations', () => {
 
       const result = extractID(schema);
       expect(result.id).toBe('gts.vendor.pkg.ns.type.v1~');
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
 
     test('handles GTS URI prefix', () => {
@@ -71,7 +81,7 @@ describe('GTS Core Operations', () => {
 
       const result = extractID(schema);
       expect(result.id).toBe('gts.vendor.pkg.ns.type.v1~');
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
   });
 
@@ -247,7 +257,7 @@ describe('GTS Store Operations', () => {
   });
 
   describe('OP#8 - Compatibility Checking', () => {
-    test('checks backward compatibility', () => {
+    test('reports adding an optional property to an open model as forward-only', () => {
       const schemaV1 = {
         $$id: 'gts.test.pkg.ns.person.v1~',
         $$schema: 'http://json-schema.org/draft-07/schema#',
@@ -275,6 +285,38 @@ describe('GTS Store Operations', () => {
       gts.register(schemaV2);
 
       const result = gts.checkCompatibility('gts.test.pkg.ns.person.v1~', 'gts.test.pkg.ns.person.v2~', 'backward');
+
+      // Spec 0.13 §4.5: the old open schema already accepted arbitrary values
+      // under `email`, so the added property schema is not backward compatible.
+      expect(result.backward_compatibility).toBe('incompatible');
+      expect(result.forward_compatibility).toBe('compatible');
+      expect(result.full_compatibility).toBe('incompatible');
+    });
+
+    test('reports annotation-only changes as fully compatible', () => {
+      const schemaV1 = {
+        $$id: 'gts.test.pkg.ns.doc.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { name: { type: 'string', description: 'The name' } },
+        required: ['name'],
+        additionalProperties: false,
+      };
+
+      const schemaV2 = {
+        $$id: 'gts.test.pkg.ns.doc.v2~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { name: { type: 'string', description: 'A better description' } },
+        required: ['name'],
+        additionalProperties: false,
+      };
+
+      gts.register(schemaV1);
+      gts.register(schemaV2);
+
+      const result = gts.checkCompatibility('gts.test.pkg.ns.doc.v1~', 'gts.test.pkg.ns.doc.v2~');
+      expect(result.full_compatibility).toBe('compatible');
       expect(result.is_fully_compatible).toBe(true);
     });
 
@@ -308,6 +350,150 @@ describe('GTS Store Operations', () => {
     });
   });
 
+  describe('OP#12 - derivation form', () => {
+    test('an allOf $ref to an unrelated type does not stand in for the chain parent', () => {
+      // Only a reference to the chain parent inherits its constraints. Without
+      // one, the derived schema has to restate them (ADR-0001 variant 2c), so
+      // dropping a required field and opening a closed base must fail.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.strict.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a', 'b'],
+        properties: { a: { type: 'string' }, b: { type: 'string' } },
+        additionalProperties: false,
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.unrelated.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.strict.v1~test.pkg._.lax.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a'],
+        properties: { a: { type: 'string' } },
+        additionalProperties: true,
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.unrelated.v1~' }],
+      });
+
+      expect(gts.validateEntity('gts.test.pkg.ns.strict.v1~test.pkg._.lax.v1~').ok).toBe(false);
+    });
+  });
+
+  describe('OP#12 - inheritance through a top-level $ref', () => {
+    test('a derived type that is exactly its parent via top-level $ref is valid', () => {
+      // ADR-0001 leaves the derivation body free; `{$ref: parent}` means
+      // "identical to the parent", which trivially satisfies derivation.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.tlbase.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a', 'b'],
+        properties: { a: { type: 'string' }, b: { type: 'string' } },
+        additionalProperties: false,
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.tlbase.v1~test.pkg._.kid.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        $$ref: 'gts://gts.test.pkg.ns.tlbase.v1~',
+      });
+
+      expect(gts.validateEntity('gts.test.pkg.ns.tlbase.v1~test.pkg._.kid.v1~').ok).toBe(true);
+    });
+  });
+
+  describe('OP#9 - a cast succeeds only if its result fits the target', () => {
+    beforeEach(() => {
+      gts.register({
+        $$id: 'gts.test.pkg.ns.shape.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a'],
+        properties: { a: { type: 'string' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.shape.v2~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['a'],
+        properties: { a: { type: 'number' } },
+      });
+    });
+
+    test('fails when the casted value does not satisfy the target type', () => {
+      gts.register({ id: 'gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1', a: 'not-a-number' });
+
+      const result = gts.castInstance('gts.test.pkg.ns.shape.v1~test.pkg._.bad.v1', 'gts.test.pkg.ns.shape.v2~');
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/must be number/);
+    });
+
+    test('succeeds when the casted value does satisfy the target type', () => {
+      gts.register({ id: 'gts.test.pkg.ns.shape.v1~test.pkg._.good.v1', a: 42 });
+
+      const result = gts.castInstance('gts.test.pkg.ns.shape.v1~test.pkg._.good.v1', 'gts.test.pkg.ns.shape.v2~');
+
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  describe('OP#9 - cast responses name the target consistently', () => {
+    test('a failed cast still reports to_type_id', () => {
+      const store = new GtsStore({ validateRefs: false });
+      store.register(
+        createJsonEntity({
+          $$id: 'gts.test.pkg.ns.castsrc.v1~',
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      );
+      store.register(createJsonEntity({ id: 'gts.test.pkg.ns.castsrc.v1~test.pkg._.item.v1' }));
+
+      // The target type is not registered, so this takes a failure path.
+      const result: Record<string, any> = store.castInstance(
+        'gts.test.pkg.ns.castsrc.v1~test.pkg._.item.v1',
+        'gts.test.pkg.ns.missing.v2~'
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.to_type_id).toBe('gts.test.pkg.ns.missing.v2~');
+      expect(result).not.toHaveProperty('to_schema_id');
+    });
+  });
+
+  describe('OP#9 - casting never lands on an abstract type', () => {
+    test('rejects a cast whose target is x-gts-abstract, mirroring direct instantiation', () => {
+      const store = new GtsStore({ validateRefs: false });
+      store.register(
+        createJsonEntity({
+          $$id: 'gts.test.pkg.ns.castabs.v1~',
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      );
+      store.register(
+        createJsonEntity({
+          $$id: 'gts.test.pkg.ns.castabs.v2~',
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+          'x-gts-abstract': true,
+        })
+      );
+      store.register(createJsonEntity({ id: 'gts.test.pkg.ns.castabs.v1~test.pkg._.item.v1' }));
+
+      const result: Record<string, any> = store.castInstance(
+        'gts.test.pkg.ns.castabs.v1~test.pkg._.item.v1',
+        'gts.test.pkg.ns.castabs.v2~'
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/abstract/i);
+    });
+  });
+
   describe('OP#9 - Version Casting', () => {
     test('casts instance between compatible versions', () => {
       const schemaV1 = {
@@ -333,9 +519,10 @@ describe('GTS Store Operations', () => {
         required: ['name'],
       };
 
+      // A document carrying `$schema` is a schema, so an instance identifies
+      // its type through the chained `id` instead.
       const instance = {
-        gtsId: 'gts.test.pkg.ns.person.v1~test.pkg.ns.john.v1.0',
-        $schema: 'gts.test.pkg.ns.person.v1~',
+        id: 'gts.test.pkg.ns.person.v1~test.pkg.ns.john.v1.0',
         name: 'John',
         age: 30,
       };
@@ -348,8 +535,95 @@ describe('GTS Store Operations', () => {
 
       expect(result.ok).toBe(true);
       expect(result.result).toBeDefined();
-      expect(result.result.gtsId).toContain('v2');
+      // The target's default is materialized into the casted instance.
       expect(result.result.email).toBe('');
+      expect(result.result.name).toBe('John');
+    });
+
+    test('casts to a derived target that pulls its parent in through allOf', () => {
+      gts.register({
+        $$id: 'gts.test.pkg.ns.staff.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        required: ['name'],
+        properties: { name: { type: 'string' }, age: { type: 'number' } },
+      });
+      // Derived types are `allOf: [{$ref: parent}, …]` by construction, so a
+      // cast that reads `properties` without resolving the ref sees nothing
+      // and drops every value.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.staff.v1~test.pkg._.employee.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [
+          { $$ref: 'gts://gts.test.pkg.ns.staff.v1~' },
+          { type: 'object', properties: { dept: { type: 'string', default: 'unassigned' } } },
+        ],
+      });
+      gts.register({ id: 'gts.test.pkg.ns.staff.v1~test.pkg.ns.ann.v1.0', name: 'Ann', age: 41 });
+
+      const result = gts.castInstance(
+        'gts.test.pkg.ns.staff.v1~test.pkg.ns.ann.v1.0',
+        'gts.test.pkg.ns.staff.v1~test.pkg._.employee.v1~'
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.result).toMatchObject({ name: 'Ann', age: 41, dept: 'unassigned' });
+    });
+
+    test('casts to a target whose allOf reaches the same shared ancestor through two branches', () => {
+      // Diamond-shaped hierarchy: `mid` and `sibling` both compose `ancestor`,
+      // and the target composes both `mid` and `sibling`. Flattening the
+      // target must revisit `ancestor` at most once so its property survives
+      // exactly once - not duplicated, not dropped - regardless of how many
+      // paths reach it.
+      gts.register({
+        $$id: 'gts.test.pkg.ns.ancestor.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: { shared: { type: 'string', default: 'from-ancestor' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.mid.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.ancestor.v1~' }],
+        properties: { fromMid: { type: 'string', default: 'mid' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.sibling.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.ancestor.v1~' }],
+        properties: { fromSibling: { type: 'string', default: 'sibling' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.diamondtarget.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        allOf: [{ $$ref: 'gts://gts.test.pkg.ns.mid.v1~' }, { $$ref: 'gts://gts.test.pkg.ns.sibling.v1~' }],
+        properties: { direct: { type: 'string', default: 'direct' } },
+      });
+      gts.register({
+        $$id: 'gts.test.pkg.ns.diamondsource.v1~',
+        $$schema: 'http://json-schema.org/draft-07/schema#',
+        type: 'object',
+        properties: {},
+      });
+      gts.register({ id: 'gts.test.pkg.ns.diamondsource.v1~test.pkg.ns.item.v1.0' });
+
+      const result = gts.castInstance(
+        'gts.test.pkg.ns.diamondsource.v1~test.pkg.ns.item.v1.0',
+        'gts.test.pkg.ns.diamondtarget.v1~'
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.result).toMatchObject({
+        shared: 'from-ancestor',
+        fromMid: 'mid',
+        fromSibling: 'sibling',
+        direct: 'direct',
+      });
     });
   });
 
@@ -390,8 +664,12 @@ describe('GTS Store Operations', () => {
 
   describe('OP#11 - Attribute Access', () => {
     test('retrieves attribute values', () => {
+      // A bare, un-chained id (no `~`-marked type segment) is a prohibited
+      // single-segment instance id per `Gts.parseGtsID` - use the same
+      // chained shape as the other instance fixtures in this file.
+      const instanceId = 'gts.test.pkg.ns.person.v1~test.pkg.ns.john.v1.0';
       const instance = {
-        gtsId: 'gts.test.pkg.ns.person.v1.0',
+        gtsId: instanceId,
         name: 'John Doe',
         address: {
           city: 'New York',
@@ -401,16 +679,104 @@ describe('GTS Store Operations', () => {
 
       gts.register(instance);
 
-      const nameResult = gts.getAttribute('gts.test.pkg.ns.person.v1.0@name');
+      const nameResult = gts.getAttribute(`${instanceId}@name`);
       expect(nameResult.resolved).toBe(true);
       expect(nameResult.value).toBe('John Doe');
 
-      const cityResult = gts.getAttribute('gts.test.pkg.ns.person.v1.0@address.city');
+      const cityResult = gts.getAttribute(`${instanceId}@address.city`);
       expect(cityResult.resolved).toBe(true);
       expect(cityResult.value).toBe('New York');
 
-      const missingResult = gts.getAttribute('gts.test.pkg.ns.person.v1.0@missing');
+      const missingResult = gts.getAttribute(`${instanceId}@missing`);
       expect(missingResult.resolved).toBe(false);
+    });
+  });
+
+  describe('register() rejects malformed entity ids', () => {
+    // A malformed id would otherwise silently break every ancestor-chain
+    // computation downstream (`buildSchemaChain` and friends), which then
+    // fail open by treating the entity as if it had no ancestors at all -
+    // so `register()` must reject it up front, for every entity kind and
+    // regardless of `validateRefs`.
+    test('rejects a schema id with an extra dot-segment before the version', () => {
+      // 5 dot-segments before `v1~` - GTS ids take exactly 4
+      // (vendor.package.namespace.type).
+      const malformedId = 'gts.x.unit.tr.nestedorphanbug.base.v1~';
+      expect(() =>
+        gts.register({
+          $$id: malformedId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
+    });
+
+    test('rejects a version missing the leading v', () => {
+      const malformedId = 'gts.vendor.pkg.ns.type.1~';
+      expect(() =>
+        gts.register({
+          $$id: malformedId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
+    });
+
+    test('rejects a chained schema id missing the trailing tilde', () => {
+      const malformedId = 'gts.vendor.pkg.ns.type.v1';
+      expect(() =>
+        gts.register({
+          $$id: malformedId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
+    });
+
+    test('rejects an empty string id', () => {
+      expect(() => gts.register({ gtsId: '' })).toThrow("Invalid GTS entity id: ''");
+    });
+  });
+
+  describe('register() accepts anonymous instances by plain UUID (gts-spec §3.7)', () => {
+    // §3.7 permits a non-schema instance to be identified by a plain UUID
+    // in its `id` field, resolving its schema via a separate `type` field
+    // rather than by the id's own GTS-chain shape - register() must accept
+    // this shape instead of rejecting it as a malformed GTS id.
+    test('accepts a non-schema instance with a plain UUID id and a `type` field', () => {
+      const uuidId = '7a1d2f34-5678-49ab-9012-abcdef123456';
+      expect(() =>
+        gts.register({
+          type: 'gts.x.test6anon.events.type.v1~x.commerce.orders.order_placed.v1.0~',
+          id: uuidId,
+          tenantId: '11111111-2222-3333-8444-555555555555',
+          occurredAt: '2025-09-20T18:35:00Z',
+          payload: { orderId: 'af0e3c1b-8f1e-4a27-9a9b-b7b9b70c1f01' },
+        })
+      ).not.toThrow();
+    });
+
+    test('still rejects a SCHEMA whose id is a plain UUID (not a valid GTS Type id)', () => {
+      // The UUID exception is instance-only - a schema must always carry a
+      // well-formed GTS Type ID.
+      const uuidId = '7a1d2f34-5678-49ab-9012-abcdef123456';
+      expect(() =>
+        gts.register({
+          $$id: uuidId,
+          $$schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+        })
+      ).toThrow(`Invalid GTS entity id: '${uuidId}'`);
+    });
+
+    test('still rejects an id that is neither a valid GTS id nor a valid UUID', () => {
+      const malformedId = 'not-a-valid-id-at-all';
+      expect(() =>
+        gts.register({
+          gtsId: malformedId,
+          name: 'irrelevant',
+        })
+      ).toThrow(`Invalid GTS entity id: '${malformedId}'`);
     });
   });
 
@@ -445,7 +811,7 @@ describe('GTS Store Operations', () => {
         type: 'object',
       };
       const result = extractID(schema);
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
 
     test('does not detect schema without $schema field', () => {
@@ -455,7 +821,7 @@ describe('GTS Store Operations', () => {
         properties: {},
       };
       const result = extractID(notSchema);
-      expect(result.is_schema).toBe(false);
+      expect(result.is_type_schema).toBe(false);
     });
 
     test('detects schema with GTS $schema reference', () => {
@@ -465,29 +831,29 @@ describe('GTS Store Operations', () => {
         type: 'object',
       };
       const result = extractID(schema);
-      expect(result.is_schema).toBe(true);
+      expect(result.is_type_schema).toBe(true);
     });
   });
 
   describe('OP#14 - Schema ID Extraction (v0.7)', () => {
-    test('extracts schema_id from chain for instances without explicit schema field', () => {
+    test('extracts type_id from chain for instances without explicit schema field', () => {
       const instance = {
         gtsId: 'gts.vendor.pkg.ns.type.v1~vendor.pkg.ns.instance.v1.0',
         data: 'test',
       };
       const result = extractID(instance);
-      // v0.7: schema_id is extracted from the chain
-      expect(result.schema_id).toBe('gts.vendor.pkg.ns.type.v1~');
+      // type_id is extracted from the chain
+      expect(result.type_id).toBe('gts.vendor.pkg.ns.type.v1~');
     });
 
-    test('extracts schema_id from chained instance ID', () => {
+    test('extracts type_id from chained instance ID', () => {
       const instance = {
         gtsId: 'gts.vendor.pkg.ns.type.v1~vendor.pkg.ns.instance.v1.0',
         $schema: 'gts.vendor.pkg.ns.type.v1~',
         data: 'test',
       };
       const result = extractID(instance);
-      expect(result.schema_id).toBe('gts.vendor.pkg.ns.type.v1~');
+      expect(result.type_id).toBe('gts.vendor.pkg.ns.type.v1~');
     });
 
     test('extracts parent type from derived schema chain', () => {
@@ -497,7 +863,7 @@ describe('GTS Store Operations', () => {
         type: 'object',
       };
       const result = extractID(schema);
-      expect(result.schema_id).toBe('gts.x.core.events.type.v1~');
+      expect(result.type_id).toBe('gts.x.core.events.type.v1~');
     });
   });
 

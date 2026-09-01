@@ -4,13 +4,14 @@ import { ServerConfig } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createJsonEntity } from '../index';
+import { PACKAGE_VERSION } from '../version';
 
 const program = new Command();
 
 program
   .name('gts-server')
   .description('GTS HTTP Server')
-  .version('0.1.0')
+  .version(PACKAGE_VERSION)
   .option('-h, --host <host>', 'Host to bind to', '127.0.0.1')
   .option('-p, --port <port>', 'Port to listen on', '8000')
   .option('-v, --verbose <level>', 'Verbosity level (0=silent, 1=info, 2=debug)', '1')

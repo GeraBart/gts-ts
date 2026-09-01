@@ -4,15 +4,14 @@ export { GtsExtractor } from './extract';
 export { GtsStore, createJsonEntity } from './store';
 export { GtsRelationships } from './relationships';
 export { GtsCompatibility } from './compatibility';
-export { GtsCast } from './cast';
 export { GtsQuery } from './query';
+export { GtsModifiers, DOCUMENT_LEVEL_KEYWORDS } from './modifiers';
 
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';
 import { GtsStore, createJsonEntity } from './store';
 import { GtsRelationships } from './relationships';
 import { GtsCompatibility } from './compatibility';
-import { GtsCast } from './cast';
 import { GtsQuery } from './query';
 import {
   ValidationResult,
@@ -26,6 +25,7 @@ import {
   CompatibilityResult,
   CastResult,
   GtsConfig,
+  EntityLookup,
 } from './types';
 
 export const isValidGtsID = (id: string): boolean => Gts.isValidGtsID(id);
@@ -89,8 +89,75 @@ export class GTS {
     return GtsCompatibility.checkCompatibility(this.store, oldId, newId, mode);
   }
 
-  castInstance(fromId: string, toSchemaId: string): CastResult {
-    return GtsCast.castInstance(this.store, fromId, toSchemaId);
+  /**
+   * OP#9 - cast an instance to another version of its type.
+   *
+   * Delegates to the registry implementation so that the library, the CLI and
+   * `POST /cast` all share one cast: it flattens the target through `allOf` and
+   * GTS `$ref`s before transforming, and validates the result against the
+   * target type.
+   */
+  castInstance(fromId: string, toTypeId: string): CastResult {
+    const result = this.store.castInstance(fromId, toTypeId);
+    return {
+      ok: result.ok,
+      fromId,
+      toId: toTypeId,
+      result: result.casted_entity ?? undefined,
+      error: result.error || undefined,
+    };
+  }
+
+  /**
+   * The raw registry cast result (every field the store computes - added /
+   * removed properties, per-direction compatibility, etc.), for callers that
+   * need the full response shape rather than the narrower `CastResult` that
+   * `castInstance()` above returns.
+   */
+  castInstanceRaw(fromId: string, toTypeId: string): any {
+    return this.store.castInstance(fromId, toTypeId);
+  }
+
+  /**
+   * The document-level GTS rules for a type schema (§9.7.1, §9.11). Delegates
+   * to the registry implementation so that `register()`, `validateEntity()`
+   * and the HTTP server all share the same check instead of the server
+   * reaching past `GtsStore`'s encapsulation to call it directly.
+   */
+  checkTypeSchemaRules(content: any, id: string | undefined, options: { enforceGuards: boolean }): string | null {
+    return this.store.checkTypeSchemaRules(content, id, options);
+  }
+
+  /**
+   * The document-level GTS rule for an instance: its rightmost type must be
+   * instantiable (§9.11.3 item 1).
+   */
+  checkInstanceRules(typeId: string | null | undefined): string | null {
+    return this.store.checkInstanceRules(typeId);
+  }
+
+  /** Resolves a single attribute path on an entity, given as two separate arguments. */
+  getAttributeAt(gtsId: string, path: string): AttributeResult {
+    return this.store.getAttribute(gtsId, path);
+  }
+
+  /**
+   * A minimal, read-only view of the registry for collaborators (e.g.
+   * `XGtsRefValidator`) that only need to resolve an id to an entity, so they
+   * do not have to depend on `GtsStore` - or reach past this class's private
+   * field to get one - just to look entities up.
+   */
+  asEntityLookup(): EntityLookup {
+    return this.store;
+  }
+
+  /**
+   * Derivation and trait completeness are both type-level properties (§9.7.5).
+   * Exposed directly because `validateEntity()` below applies it only after
+   * first resolving `id` to an entity.
+   */
+  validateSchemaAgainstParent(schemaId: string): ValidationResult {
+    return this.store.validateSchemaAgainstParent(schemaId);
   }
 
   validateEntity(id: string): ValidationResult & { entity_type: string } {
@@ -100,14 +167,9 @@ export class GTS {
     }
 
     if (entity.isSchema) {
+      // Derivation and trait completeness are both type-level properties, so
+      // /validate-entity applies exactly the same checks as OP#12 (§9.7.5).
       const result = this.store.validateSchemaAgainstParent(id);
-      if (!result.ok) {
-        return { ...result, entity_type: 'schema' };
-      }
-      const traitsResult = this.store.validateEntityTraits(id);
-      if (!traitsResult.ok) {
-        return { ...traitsResult, entity_type: 'schema' };
-      }
       return { ...result, entity_type: 'schema' };
     } else {
       const result = this.store.validateInstance(id);

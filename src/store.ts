@@ -1,8 +1,10 @@
 import Ajv from 'ajv';
-import { GtsConfig, JsonEntity, ValidationResult, CompatibilityResult, GTS_URI_PREFIX } from './types';
+import { GtsConfig, JsonEntity, ValidationResult, GTS_URI_PREFIX, MAX_SCHEMA_DEPTH, MAX_SCHEMA_PATHS } from './types';
 import { Gts } from './gts';
 import { GtsExtractor } from './extract';
 import { XGtsRefValidator } from './x-gts-ref';
+import { GtsCompatibility, findCrossedBound, isEmptySchema } from './compatibility';
+import { GtsModifiers } from './modifiers';
 
 interface ResolvedSchema {
   properties: Record<string, any>;
@@ -10,6 +12,15 @@ interface ResolvedSchema {
   additionalProperties?: boolean;
   type?: string;
 }
+
+/**
+ * Keywords that describe an object level's structure rather than the value
+ * constraints of a single property - gts-rust's `STRUCTURAL_KEYWORDS`
+ * (`schema_derivation.rs`), used by `declaredTraitSchema`/`absorbProperty` to
+ * decide which keywords a restated property replaces wholesale versus which
+ * ones compose across `allOf` branches.
+ */
+const TRAIT_STRUCTURAL_KEYWORDS = ['properties', 'required', 'additionalProperties'];
 
 export class GtsStore {
   private byId: Map<string, JsonEntity> = new Map();
@@ -45,6 +56,21 @@ export class GtsStore {
   }
 
   register(entity: JsonEntity): void {
+    // A malformed entity id would silently break every ancestor-chain
+    // computation downstream (`buildSchemaChain` and friends), which then
+    // fail open by treating the entity as if it had no ancestors at all -
+    // so, like the modifier-declaration check below, this MUST be rejected
+    // unconditionally at registration time, regardless of `validateRefs` or
+    // any other config. A SCHEMA must always carry a well-formed GTS Type
+    // ID. A non-schema INSTANCE may instead be an "anonymous instance"
+    // (gts-spec §3.7): identified by a plain UUID, with schema resolution
+    // carried by its own `type` field rather than by the id's GTS-chain
+    // shape - so a plain UUID id is accepted for instances only.
+    const hasValidId = Gts.isValidGtsID(entity.id) || (!entity.isSchema && Gts.isUuid(entity.id));
+    if (!hasValidId) {
+      throw new Error(`Invalid GTS entity id: '${entity.id}'`);
+    }
+
     if (this.config.validateRefs) {
       for (const ref of entity.references) {
         if (!this.byId.has(ref)) {
@@ -52,6 +78,20 @@ export class GtsStore {
         }
       }
     }
+
+    // A malformed modifier declaration (mutually-exclusive x-gts-final +
+    // x-gts-abstract, or a non-boolean value) "MUST be rejected during schema
+    // registration" (§9.11.1) unconditionally - unlike the placement/guard
+    // checks in `checkTypeSchemaRules`'s `enforceGuards` branch, this part
+    // does not depend on `validateEntity`/HTTP-only enforcement, so it has to
+    // run here to cover every entry point (library, CLI, HTTP).
+    if (entity.isSchema && entity.content) {
+      const declarationError = this.checkTypeSchemaRules(entity.content, entity.id, { enforceGuards: false });
+      if (declarationError) {
+        throw new Error(declarationError);
+      }
+    }
+
     this.byId.set(entity.id, entity);
 
     // If this is a schema, add it to AJV for reference resolution
@@ -136,6 +176,16 @@ export class GtsStore {
           ok: false,
           valid: false,
           error: `Entity '${obj.schemaId}' is not a schema`,
+        };
+      }
+
+      // §9.11.3 item 2 - the rightmost type in the chain must be instantiable
+      if (GtsModifiers.isAbstract(schemaEntity.content)) {
+        return {
+          id: gtsId,
+          ok: false,
+          valid: false,
+          error: `Type '${obj.schemaId}' is abstract and cannot be directly instantiated`,
         };
       }
 
@@ -377,334 +427,6 @@ export class GtsStore {
     return (s.startsWith('http://') || s.startsWith('https://')) && s.includes('json-schema.org');
   }
 
-  checkCompatibility(oldSchemaId: string, newSchemaId: string, _mode?: string): CompatibilityResult {
-    const oldEntity = this.get(oldSchemaId);
-    const newEntity = this.get(newSchemaId);
-
-    if (!oldEntity || !newEntity) {
-      return {
-        from: oldSchemaId,
-        to: newSchemaId,
-        old: oldSchemaId,
-        new: newSchemaId,
-        direction: 'unknown',
-        added_properties: [],
-        removed_properties: [],
-        changed_properties: [],
-        is_fully_compatible: false,
-        is_backward_compatible: false,
-        is_forward_compatible: false,
-        incompatibility_reasons: [],
-        backward_errors: ['Schema not found'],
-        forward_errors: ['Schema not found'],
-      };
-    }
-
-    const oldSchema = oldEntity.content;
-    const newSchema = newEntity.content;
-
-    if (!oldSchema || !newSchema) {
-      return {
-        from: oldSchemaId,
-        to: newSchemaId,
-        old: oldSchemaId,
-        new: newSchemaId,
-        direction: 'unknown',
-        added_properties: [],
-        removed_properties: [],
-        changed_properties: [],
-        is_fully_compatible: false,
-        is_backward_compatible: false,
-        is_forward_compatible: false,
-        incompatibility_reasons: [],
-        backward_errors: ['Invalid schema content'],
-        forward_errors: ['Invalid schema content'],
-      };
-    }
-
-    // Check compatibility
-    const { isBackward, backwardErrors } = this.checkBackwardCompatibility(oldSchema, newSchema);
-    const { isForward, forwardErrors } = this.checkForwardCompatibility(oldSchema, newSchema);
-
-    // Determine direction
-    const direction = this.inferDirection(oldSchemaId, newSchemaId);
-
-    return {
-      from: oldSchemaId,
-      to: newSchemaId,
-      old: oldSchemaId,
-      new: newSchemaId,
-      direction,
-      added_properties: [],
-      removed_properties: [],
-      changed_properties: [],
-      is_fully_compatible: isBackward && isForward,
-      is_backward_compatible: isBackward,
-      is_forward_compatible: isForward,
-      incompatibility_reasons: [],
-      backward_errors: backwardErrors,
-      forward_errors: forwardErrors,
-    };
-  }
-
-  private inferDirection(fromId: string, toId: string): string {
-    try {
-      const fromGtsId = Gts.parseGtsID(fromId);
-      const toGtsId = Gts.parseGtsID(toId);
-
-      if (!fromGtsId.segments.length || !toGtsId.segments.length) {
-        return 'unknown';
-      }
-
-      const fromSeg = fromGtsId.segments[fromGtsId.segments.length - 1];
-      const toSeg = toGtsId.segments[toGtsId.segments.length - 1];
-
-      if (fromSeg.verMinor !== undefined && toSeg.verMinor !== undefined) {
-        if (toSeg.verMinor > fromSeg.verMinor) {
-          return 'up';
-        }
-        if (toSeg.verMinor < fromSeg.verMinor) {
-          return 'down';
-        }
-        return 'none';
-      }
-
-      return 'unknown';
-    } catch {
-      return 'unknown';
-    }
-  }
-
-  private checkBackwardCompatibility(
-    oldSchema: any,
-    newSchema: any
-  ): { isBackward: boolean; backwardErrors: string[] } {
-    return this.checkSchemaCompatibility(oldSchema, newSchema, true);
-  }
-
-  private checkForwardCompatibility(oldSchema: any, newSchema: any): { isForward: boolean; forwardErrors: string[] } {
-    return this.checkSchemaCompatibility(oldSchema, newSchema, false);
-  }
-
-  private checkSchemaCompatibility(oldSchema: any, newSchema: any, checkBackward: boolean): any {
-    const errors: string[] = [];
-
-    // Flatten schemas to handle allOf
-    const oldFlat = this.flattenSchema(oldSchema);
-    const newFlat = this.flattenSchema(newSchema);
-
-    const oldProps = oldFlat.properties || {};
-    const newProps = newFlat.properties || {};
-    const oldRequired = new Set(oldFlat.required || []);
-    const newRequired = new Set(newFlat.required || []);
-
-    // Check required properties changes
-    if (checkBackward) {
-      // Backward: cannot add required properties
-      const newlyRequired = Array.from(newRequired).filter((p) => !oldRequired.has(p));
-      if (newlyRequired.length > 0) {
-        errors.push(`Added required properties: ${newlyRequired.join(', ')}`);
-      }
-    } else {
-      // Forward: cannot remove required properties
-      const removedRequired = Array.from(oldRequired).filter((p) => !newRequired.has(p));
-      if (removedRequired.length > 0) {
-        errors.push(`Removed required properties: ${removedRequired.join(', ')}`);
-      }
-    }
-
-    // Check properties that exist in both schemas
-    const commonProps = Object.keys(oldProps).filter((k) => k in newProps);
-    for (const prop of commonProps) {
-      const oldPropSchema = oldProps[prop] || {};
-      const newPropSchema = newProps[prop] || {};
-
-      // Check if type changed
-      const oldType = oldPropSchema.type;
-      const newType = newPropSchema.type;
-      if (oldType && newType && oldType !== newType) {
-        errors.push(`Property '${prop}' type changed from ${oldType} to ${newType}`);
-      }
-
-      // Check enum constraints
-      const oldEnum = oldPropSchema.enum || [];
-      const newEnum = newPropSchema.enum || [];
-      if (oldEnum.length > 0 && newEnum.length > 0) {
-        const oldEnumSet = new Set(oldEnum);
-        const newEnumSet = new Set(newEnum);
-        if (checkBackward) {
-          // Backward: cannot add enum values
-          const addedEnumValues = newEnum.filter((v: any) => !oldEnumSet.has(v));
-          if (addedEnumValues.length > 0) {
-            errors.push(`Property '${prop}' added enum values: ${addedEnumValues.join(', ')}`);
-          }
-        } else {
-          // Forward: cannot remove enum values
-          const removedEnumValues = oldEnum.filter((v: any) => !newEnumSet.has(v));
-          if (removedEnumValues.length > 0) {
-            errors.push(`Property '${prop}' removed enum values: ${removedEnumValues.join(', ')}`);
-          }
-        }
-      }
-
-      // Check constraint compatibility
-      errors.push(...this.checkConstraintCompatibility(prop, oldPropSchema, newPropSchema, checkBackward));
-
-      // Recursively check nested object properties
-      if (oldType === 'object' && newType === 'object') {
-        const nestedResult = this.checkSchemaCompatibility(oldPropSchema, newPropSchema, checkBackward);
-        const nestedErrors = checkBackward ? nestedResult.backwardErrors : nestedResult.forwardErrors;
-        if (nestedErrors) {
-          errors.push(...nestedErrors.map((e: string) => `Property '${prop}': ${e}`));
-        }
-      }
-
-      // Recursively check array item schemas
-      if (oldType === 'array' && newType === 'array' && oldPropSchema.items && newPropSchema.items) {
-        const itemsResult = this.checkSchemaCompatibility(oldPropSchema.items, newPropSchema.items, checkBackward);
-        const itemsErrors = checkBackward ? itemsResult.backwardErrors : itemsResult.forwardErrors;
-        if (itemsErrors) {
-          errors.push(...itemsErrors.map((e: string) => `Property '${prop}' array items: ${e}`));
-        }
-      }
-    }
-
-    if (checkBackward) {
-      return { isBackward: errors.length === 0, backwardErrors: errors };
-    } else {
-      return { isForward: errors.length === 0, forwardErrors: errors };
-    }
-  }
-
-  private checkConstraintCompatibility(
-    prop: string,
-    oldPropSchema: any,
-    newPropSchema: any,
-    checkTightening: boolean
-  ): string[] {
-    const errors: string[] = [];
-    const propType = oldPropSchema.type;
-
-    // Numeric constraints
-    if (propType === 'number' || propType === 'integer') {
-      errors.push(
-        ...this.checkMinMaxConstraint(prop, oldPropSchema, newPropSchema, 'minimum', 'maximum', checkTightening)
-      );
-    }
-
-    // String constraints
-    if (propType === 'string') {
-      errors.push(
-        ...this.checkMinMaxConstraint(prop, oldPropSchema, newPropSchema, 'minLength', 'maxLength', checkTightening)
-      );
-    }
-
-    // Array constraints
-    if (propType === 'array') {
-      errors.push(
-        ...this.checkMinMaxConstraint(prop, oldPropSchema, newPropSchema, 'minItems', 'maxItems', checkTightening)
-      );
-    }
-
-    return errors;
-  }
-
-  private checkMinMaxConstraint(
-    prop: string,
-    oldSchema: any,
-    newSchema: any,
-    minKey: string,
-    maxKey: string,
-    checkTightening: boolean
-  ): string[] {
-    const errors: string[] = [];
-
-    const oldMin = oldSchema[minKey];
-    const newMin = newSchema[minKey];
-    const oldMax = oldSchema[maxKey];
-    const newMax = newSchema[maxKey];
-
-    // Check minimum constraint
-    if (checkTightening) {
-      // Backward: cannot increase minimum (tighten)
-      if (oldMin !== undefined && newMin !== undefined && newMin > oldMin) {
-        errors.push(`Property '${prop}' ${minKey} increased from ${oldMin} to ${newMin}`);
-      } else if (oldMin === undefined && newMin !== undefined) {
-        errors.push(`Property '${prop}' added ${minKey} constraint: ${newMin}`);
-      }
-    } else {
-      // Forward: cannot decrease minimum (relax)
-      if (oldMin !== undefined && newMin !== undefined && newMin < oldMin) {
-        errors.push(`Property '${prop}' ${minKey} decreased from ${oldMin} to ${newMin}`);
-      } else if (oldMin !== undefined && newMin === undefined) {
-        errors.push(`Property '${prop}' removed ${minKey} constraint`);
-      }
-    }
-
-    // Check maximum constraint
-    if (checkTightening) {
-      // Backward: cannot decrease maximum (tighten)
-      if (oldMax !== undefined && newMax !== undefined && newMax < oldMax) {
-        errors.push(`Property '${prop}' ${maxKey} decreased from ${oldMax} to ${newMax}`);
-      } else if (oldMax === undefined && newMax !== undefined) {
-        errors.push(`Property '${prop}' added ${maxKey} constraint: ${newMax}`);
-      }
-    } else {
-      // Forward: cannot increase maximum (relax)
-      if (oldMax !== undefined && newMax !== undefined && newMax > oldMax) {
-        errors.push(`Property '${prop}' ${maxKey} increased from ${oldMax} to ${newMax}`);
-      } else if (oldMax !== undefined && newMax === undefined) {
-        errors.push(`Property '${prop}' removed ${maxKey} constraint`);
-      }
-    }
-
-    return errors;
-  }
-
-  private flattenSchema(schema: any): any {
-    const result: any = {
-      properties: {},
-      required: [],
-    };
-
-    // Merge allOf schemas
-    if (schema.allOf && Array.isArray(schema.allOf)) {
-      for (const subSchema of schema.allOf) {
-        const flattened = this.flattenSchema(subSchema);
-
-        // Merge properties
-        Object.assign(result.properties, flattened.properties || {});
-
-        // Merge required
-        if (flattened.required && Array.isArray(flattened.required)) {
-          result.required.push(...flattened.required);
-        }
-
-        // Preserve additionalProperties
-        if (flattened.additionalProperties !== undefined) {
-          result.additionalProperties = flattened.additionalProperties;
-        }
-      }
-    }
-
-    // Add direct properties
-    if (schema.properties) {
-      Object.assign(result.properties, schema.properties);
-    }
-
-    // Add direct required
-    if (schema.required && Array.isArray(schema.required)) {
-      result.required.push(...schema.required);
-    }
-
-    // Top level additionalProperties overrides
-    if (schema.additionalProperties !== undefined) {
-      result.additionalProperties = schema.additionalProperties;
-    }
-
-    return result;
-  }
-
   castInstance(instanceId: string, toSchemaId: string): any {
     try {
       // Get instance entity
@@ -712,7 +434,7 @@ export class GtsStore {
       if (!instanceEntity) {
         return {
           instance_id: instanceId,
-          to_schema_id: toSchemaId,
+          to_type_id: toSchemaId,
           ok: false,
           error: `Entity not found: ${instanceId}`,
         };
@@ -723,7 +445,7 @@ export class GtsStore {
       if (!toSchema) {
         return {
           instance_id: instanceId,
-          to_schema_id: toSchemaId,
+          to_type_id: toSchemaId,
           ok: false,
           error: `Schema not found: ${toSchemaId}`,
         };
@@ -736,7 +458,7 @@ export class GtsStore {
         // Not allowed to cast directly from a schema
         return {
           instance_id: instanceId,
-          to_schema_id: toSchemaId,
+          to_type_id: toSchemaId,
           ok: false,
           error: 'Source must be an instance, not a schema',
         };
@@ -746,7 +468,7 @@ export class GtsStore {
         if (!fromSchemaId) {
           return {
             instance_id: instanceId,
-            to_schema_id: toSchemaId,
+            to_type_id: toSchemaId,
             ok: false,
             error: `Schema not found for instance: ${instanceId}`,
           };
@@ -755,7 +477,7 @@ export class GtsStore {
         if (fromSchemaId.startsWith('http://') || fromSchemaId.startsWith('https://')) {
           return {
             instance_id: instanceId,
-            to_schema_id: toSchemaId,
+            to_type_id: toSchemaId,
             ok: false,
             error: `Cannot cast instance with schema ${fromSchemaId}`,
           };
@@ -764,7 +486,7 @@ export class GtsStore {
         if (!fromSchema) {
           return {
             instance_id: instanceId,
-            to_schema_id: toSchemaId,
+            to_type_id: toSchemaId,
             ok: false,
             error: `Schema not found: ${fromSchemaId}`,
           };
@@ -776,12 +498,31 @@ export class GtsStore {
       const fromSchemaContent = fromSchema.content;
       const toSchemaContent = toSchema.content;
 
+      // A cast that lands on an abstract type would produce an instance the
+      // registry could never accept directly (§9.11.3), so reject it here
+      // too rather than only at direct instantiation/validation time.
+      if (GtsModifiers.isAbstract(toSchemaContent)) {
+        return {
+          instance_id: instanceId,
+          to_type_id: toSchemaId,
+          ok: false,
+          error: `Cannot cast to abstract type: ${toSchemaId}`,
+        };
+      }
+
       // Perform the cast
-      return this.performCast(instanceId, toSchemaId, instanceContent, fromSchemaContent, toSchemaContent);
+      return this.performCast(
+        instanceId,
+        fromSchemaId,
+        toSchemaId,
+        instanceContent,
+        fromSchemaContent,
+        toSchemaContent
+      );
     } catch (error) {
       return {
         instance_id: instanceId,
-        to_schema_id: toSchemaId,
+        to_type_id: toSchemaId,
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       };
@@ -790,26 +531,33 @@ export class GtsStore {
 
   private performCast(
     fromInstanceId: string,
+    fromSchemaId: string,
     toSchemaId: string,
     fromInstanceContent: any,
     fromSchemaContent: any,
     toSchemaContent: any
   ): any {
-    // Flatten target schema to merge allOf
-    const targetSchema = this.flattenSchema(toSchemaContent);
+    // Flatten target schema to merge allOf. `resolveSchemaFully` is the
+    // visited-set-protected implementation already used elsewhere in this
+    // file; reusing it here avoids a third divergent "flatten a schema" copy
+    // and its exponential blowup on diamond-shaped multi-parent hierarchies.
+    const targetSchema = this.resolveSchemaFully(toSchemaContent);
 
     // Determine direction
-    const direction = this.inferDirection(fromInstanceId, toSchemaId);
+    // The direction is a property of the two type schemas. Deriving it from
+    // the instance identifier compares the instance's own version against the
+    // target type and gets the answer wrong.
+    const direction = GtsCompatibility.inferDirection(fromSchemaId, toSchemaId);
 
     // Determine which is old/new based on direction
     let oldSchema: any;
     let newSchema: any;
     switch (direction) {
-      case 'up':
+      case 'upgrade':
         oldSchema = fromSchemaContent;
         newSchema = toSchemaContent;
         break;
-      case 'down':
+      case 'downgrade':
         oldSchema = toSchemaContent;
         newSchema = fromSchemaContent;
         break;
@@ -819,9 +567,12 @@ export class GtsStore {
         break;
     }
 
-    // Check compatibility
-    const { isBackward, backwardErrors } = this.checkBackwardCompatibility(oldSchema, newSchema);
-    const { isForward, forwardErrors } = this.checkForwardCompatibility(oldSchema, newSchema);
+    // Check evolution compatibility between the two type schemas (spec §4.2)
+    const { backward, forward } = GtsCompatibility.compareSchemas(this, oldSchema, newSchema);
+    const isBackward = backward === 'compatible';
+    const isForward = forward === 'compatible';
+    const backwardErrors = isBackward ? [] : [`Backward compatibility is ${backward}`];
+    const forwardErrors = isForward ? [] : [`Forward compatibility is ${forward}`];
 
     // Apply casting rules to transform the instance
     const { casted, added, removed, incompatibilityReasons } = this.castInstanceToSchema(
@@ -830,22 +581,14 @@ export class GtsStore {
       ''
     );
 
-    // Validate the casted instance against the target schema
+    // The cast succeeds only if its result satisfies the target type.
     let isFullyCompatible = false;
     if (casted) {
-      try {
-        const modifiedSchema = this.removeGtsConstConstraints(toSchemaContent);
-        const validate = this.ajv.compile(this.normalizeSchema(modifiedSchema));
-        const isValid = validate(casted);
-        if (!isValid) {
-          const errors =
-            validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Validation failed';
-          incompatibilityReasons.push(errors);
-        } else {
-          isFullyCompatible = true;
-        }
-      } catch (err) {
-        incompatibilityReasons.push(err instanceof Error ? err.message : String(err));
+      const validationError = this.validateCastResult(toSchemaContent, casted);
+      if (validationError) {
+        incompatibilityReasons.push(validationError);
+      } else {
+        isFullyCompatible = true;
       }
     }
 
@@ -866,7 +609,7 @@ export class GtsStore {
       forward_errors: forwardErrors,
       casted_entity: casted,
       instance_id: fromInstanceId,
-      to_schema_id: toSchemaId,
+      to_type_id: toSchemaId,
       ok: isFullyCompatible,
       error: isFullyCompatible ? '' : incompatibilityReasons.join('; '),
     };
@@ -1026,6 +769,32 @@ export class GtsStore {
     return schema;
   }
 
+  /**
+   * Validates a cast result against the target type schema, ignoring the
+   * identity `const`s that a cast legitimately rewrites (§4.6.3). Returns an
+   * error message, or null when the result satisfies the target type.
+   */
+  validateCastResult(toSchema: any, casted: any): string | null {
+    try {
+      const modifiedSchema = this.removeGtsConstConstraints(toSchema);
+      const validate = this.ajv.compile(this.normalizeSchema(modifiedSchema));
+      if (!validate(casted)) {
+        return validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Validation failed';
+      }
+
+      // `x-gts-ref` is an assertion enforced on instances (§9.6), so a cast
+      // result has to satisfy it just as a registered instance would.
+      const xGtsRefErrors = new XGtsRefValidator(this).validateInstance(casted, toSchema);
+      if (xGtsRefErrors.length > 0) {
+        return `x-gts-ref validation failed: ${xGtsRefErrors.map((err) => err.reason).join('; ')}`;
+      }
+
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   private removeGtsConstConstraints(schema: any): any {
     if (schema === null || schema === undefined) {
       return schema;
@@ -1097,15 +866,28 @@ export class GtsStore {
 
     const content = entity.content;
 
-    // Find parent reference in allOf
-    const parentRef = this.findParentRef(content);
-    if (!parentRef) {
+    // §9.11.5 - the explicit validation endpoints always enforce the guards.
+    const ruleError = this.checkTypeSchemaRules(content, schemaId, { enforceGuards: true });
+    if (ruleError) {
+      return { id: schemaId, ok: false, error: ruleError };
+    }
+
+    // Per ADR-0001 derivation is established by the chained `$id` alone, so the
+    // parent is taken from the chain. A body that references the parent via
+    // `allOf` + `$ref` and one that restates the parent's fields are both valid
+    // derivation forms and are checked identically.
+    let chain: string[];
+    try {
+      chain = this.buildSchemaChain(schemaId);
+    } catch (err) {
+      return { id: schemaId, ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    const parentId = chain.length > 1 ? chain[chain.length - 2] : null;
+    if (!parentId) {
       // Base schema with no parent → still validate traits
       return this.validateSchemaTraits(schemaId);
     }
 
-    // Resolve parent entity
-    const parentId = parentRef.startsWith(GTS_URI_PREFIX) ? parentRef.substring(GTS_URI_PREFIX.length) : parentRef;
     const parentEntity = this.get(parentId);
     if (!parentEntity) {
       return { id: schemaId, ok: false, error: `Parent schema not found: ${parentId}` };
@@ -1127,7 +909,8 @@ export class GtsStore {
     const overlay = this.extractOverlay(content);
 
     // Compare overlay against resolved parent
-    const errors = this.compareOverlayToBase(overlay, resolvedParent, '');
+    const inheritsViaRef = this.inheritsParentViaRef(content, parentId);
+    const errors = this.compareOverlayToBase(overlay, resolvedParent, '', inheritsViaRef);
     if (errors.length > 0) {
       return { id: schemaId, ok: false, error: errors.join('; ') };
     }
@@ -1141,85 +924,81 @@ export class GtsStore {
     return { id: schemaId, ok: true, error: '' };
   }
 
-  // OP#13: Validate schema traits across the inheritance chain
+  /**
+   * OP#13 - trait validation across the `$id` chain (spec §9.7.5, ADR-0002/3/4).
+   *
+   *   1. effective trait-schema = `allOf` of every top-level `x-gts-traits-schema`
+   *      along the chain, root to leaf;
+   *   2. effective traits object = every top-level `x-gts-traits` applied in turn
+   *      as an RFC 7396 JSON Merge Patch, root to leaf;
+   *   3. materialize trait-schema `default`s for properties the merge left absent;
+   *   4. for non-abstract types, the materialized object must validate against the
+   *      effective trait-schema (the "completeness check").
+   *
+   * There is no bespoke immutability rule: a publisher locks a trait value with
+   * `const` in the trait-schema, which the standard validation in step 4 enforces.
+   */
   private validateSchemaTraits(schemaId: string): ValidationResult {
-    // Build the chain of schema IDs from base to leaf
-    const chain = this.buildSchemaChain(schemaId);
+    let chain: string[];
+    try {
+      chain = this.buildSchemaChain(schemaId);
+    } catch (err) {
+      return { id: schemaId, ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
 
-    // Collect trait schemas and trait values from each level, tracking immutability
     const traitSchemas: any[] = [];
-    const mergedTraits: Record<string, any> = {};
-    const lockedTraits = new Set<string>();
-    const knownDefaults = new Map<string, any>();
+    // `x-gts-traits-schema: false` is the "no traits permitted" declaration and
+    // makes the aggregate unsatisfiable; tracked separately so that a subtree
+    // with no traits at all still validates (ADR-0002).
+    let traitsProhibited = false;
+    // A `true` declaration constrains nothing but still establishes that the
+    // chain defines a trait surface, so descendants may carry trait values.
+    let hasTraitSchemaDeclaration = false;
+    let effectiveTraits: Record<string, any> = {};
 
     for (const chainSchemaId of chain) {
       const entity = this.get(chainSchemaId);
       if (!entity || !entity.content) continue;
+      const content = entity.content;
 
-      // Collect trait schemas from this level and track which properties this level introduces
-      const prevSchemaCount = traitSchemas.length;
-      this.collectTraitSchemas(entity.content, traitSchemas);
-      const levelSchemaProps = new Set<string>();
-      for (const ts of traitSchemas.slice(prevSchemaCount)) {
-        if (typeof ts === 'object' && ts !== null && typeof ts.properties === 'object' && ts.properties !== null) {
-          for (const [propName, propSchema] of Object.entries(ts.properties)) {
-            levelSchemaProps.add(propName);
-            // Detect default override: ancestor default cannot be changed by descendant
-            if (
-              typeof propSchema === 'object' &&
-              propSchema !== null &&
-              'default' in (propSchema as Record<string, any>)
-            ) {
-              const newDefault = (propSchema as Record<string, any>).default;
-              if (knownDefaults.has(propName)) {
-                const oldDefault = knownDefaults.get(propName);
-                if (JSON.stringify(oldDefault) !== JSON.stringify(newDefault)) {
-                  return {
-                    id: schemaId,
-                    ok: false,
-                    error: `trait schema default for '${propName}' in '${chainSchemaId}' overrides default set by ancestor`,
-                  };
-                }
-              } else {
-                knownDefaults.set(propName, newDefault);
-              }
-            }
+      const declaredSchema = content['x-gts-traits-schema'];
+      if (declaredSchema !== undefined) {
+        hasTraitSchemaDeclaration = true;
+        if (declaredSchema === false) {
+          traitsProhibited = true;
+        } else if (declaredSchema !== true) {
+          const isPlainObject =
+            typeof declaredSchema === 'object' && declaredSchema !== null && !Array.isArray(declaredSchema);
+          if (!isPlainObject) {
+            return {
+              id: schemaId,
+              ok: false,
+              error: `x-gts-traits-schema in '${chainSchemaId}' must be an object subschema or a boolean`,
+            };
+          }
+          try {
+            traitSchemas.push(this.resolveTraitSchemaRefs(declaredSchema, new Set()));
+          } catch (e) {
+            return { id: schemaId, ok: false, error: e instanceof Error ? e.message : String(e) };
           }
         }
       }
 
-      // Collect trait values from this level
-      const levelTraits: Record<string, any> = {};
-      this.collectTraitValues(entity.content, levelTraits);
-
-      // Check immutability: trait values set by ancestor are locked unless
-      // this level also introduces a trait schema covering that property
-      for (const [k, v] of Object.entries(levelTraits)) {
-        if (k in mergedTraits && JSON.stringify(mergedTraits[k]) !== JSON.stringify(v) && lockedTraits.has(k)) {
+      const declaredValues = content['x-gts-traits'];
+      if (declaredValues !== undefined) {
+        if (typeof declaredValues !== 'object' || declaredValues === null || Array.isArray(declaredValues)) {
           return {
             id: schemaId,
             ok: false,
-            error: `trait '${k}' in '${chainSchemaId}' overrides value set by ancestor`,
+            error: `x-gts-traits in '${chainSchemaId}' must be an object`,
           };
         }
+        effectiveTraits = this.applyMergePatch(effectiveTraits, declaredValues);
       }
-
-      // Mark trait values as locked or unlocked based on whether this level
-      // also introduced a trait schema covering the property
-      for (const k of Object.keys(levelTraits)) {
-        if (levelSchemaProps.has(k)) {
-          lockedTraits.delete(k);
-        } else {
-          lockedTraits.add(k);
-        }
-      }
-
-      Object.assign(mergedTraits, levelTraits);
     }
 
-    // If no trait schemas in the chain, nothing to validate
-    if (traitSchemas.length === 0) {
-      if (Object.keys(mergedTraits).length > 0) {
+    if (!hasTraitSchemaDeclaration) {
+      if (Object.keys(effectiveTraits).length > 0) {
         return {
           id: schemaId,
           ok: false,
@@ -1229,64 +1008,42 @@ export class GtsStore {
       return { id: schemaId, ok: true, error: '' };
     }
 
-    // Validate each trait schema
-    for (let i = 0; i < traitSchemas.length; i++) {
-      const ts = traitSchemas[i];
+    const effectiveSchema: any = traitSchemas.length === 1 ? traitSchemas[0] : { allOf: traitSchemas };
+    const materialized = this.applyTraitDefaults(effectiveSchema, effectiveTraits);
 
-      // Check: trait schema must have type "object" (or no type, which defaults to object)
-      if (typeof ts === 'object' && ts !== null && ts.type && ts.type !== 'object') {
-        return {
-          id: schemaId,
-          ok: false,
-          error: `x-gts-traits-schema must have type "object", got "${ts.type}"`,
-        };
-      }
-
-      // Check: trait schema must not contain x-gts-traits
-      if (typeof ts === 'object' && ts !== null && ts['x-gts-traits']) {
-        return {
-          id: schemaId,
-          ok: false,
-          error: 'x-gts-traits-schema must not contain x-gts-traits',
-        };
-      }
+    // The effective trait-schema must be satisfiable in the first place. This
+    // is a property of the composed schema, so - unlike completeness - it is
+    // checked for abstract types too.
+    const unsatisfiable = this.validateTraitChainSatisfiability(traitSchemas);
+    if (unsatisfiable) {
+      return { id: schemaId, ok: false, error: `effective trait schema cannot be satisfied: ${unsatisfiable}` };
     }
 
-    // Resolve $ref inside trait schemas and check for cycles
-    const resolvedTraitSchemas: any[] = [];
-    for (const ts of traitSchemas) {
-      try {
-        const resolved = this.resolveTraitSchemaRefs(ts, new Set());
-        resolvedTraitSchemas.push(resolved);
-      } catch (e) {
-        return {
-          id: schemaId,
-          ok: false,
-          error: e instanceof Error ? e.message : String(e),
-        };
-      }
-    }
-
-    // Build effective trait schema (allOf composition)
-    let effectiveSchema: any;
-    if (resolvedTraitSchemas.length === 1) {
-      effectiveSchema = resolvedTraitSchemas[0];
-    } else {
-      effectiveSchema = {
-        type: 'object',
-        allOf: resolvedTraitSchemas,
+    // `x-gts-traits-schema: false` bans traits across the whole subtree, which
+    // is a prohibition rather than a completeness requirement - so it applies
+    // to abstract members of that subtree too, and is checked before the
+    // abstract exemption below.
+    if (traitsProhibited && Object.keys(materialized).length > 0) {
+      return {
+        id: schemaId,
+        ok: false,
+        error: 'x-gts-traits-schema is false in the inheritance chain, so no traits are permitted',
       };
     }
 
-    // Apply defaults from trait schema to merged traits
-    const effectiveTraits = this.applyTraitDefaults(effectiveSchema, mergedTraits);
+    // Abstract types are exempt from completeness: descendants close the gaps.
+    const self = this.get(schemaId);
+    if (self && GtsModifiers.isAbstract(self.content)) {
+      return { id: schemaId, ok: true, error: '' };
+    }
 
-    // Validate effective traits against effective schema using AJV
+    if (traitSchemas.length === 0) {
+      return { id: schemaId, ok: true, error: '' };
+    }
+
     try {
-      const normalizedSchema = this.normalizeSchema(effectiveSchema);
-      const validate = this.ajv.compile(normalizedSchema);
-      const isValid = validate(effectiveTraits);
-      if (!isValid) {
+      const validate = this.ajv.compile(this.normalizeSchema(effectiveSchema));
+      if (!validate(materialized)) {
         const errors =
           validate.errors?.map((e) => `${e.instancePath} ${e.message}`).join('; ') || 'Trait validation failed';
         return { id: schemaId, ok: false, error: `trait validation: ${errors}` };
@@ -1299,83 +1056,482 @@ export class GtsStore {
       };
     }
 
-    // Check for unresolved trait properties (no value and no default)
-    const allProps = this.collectAllTraitProperties(effectiveSchema);
-    for (const [propName, propSchema] of Object.entries(allProps)) {
-      const hasValue = propName in effectiveTraits;
-      const hasDefault = typeof propSchema === 'object' && propSchema !== null && 'default' in propSchema;
-      if (!hasValue && !hasDefault) {
-        return {
-          id: schemaId,
-          ok: false,
-          error: `trait property '${propName}' is not resolved: no value provided and no default defined`,
-        };
-      }
+    // `x-gts-ref` is an assertion keyword (§9.6) that plain Ajv validation
+    // ignores, so materialized trait values must also be checked against it
+    // explicitly - mirroring the same check applied to cast results above.
+    // Unlike that check, no store is passed here: trait values are
+    // schema-level example/default data documenting a type's shape, not live
+    // references that must already be registered, so only GTS-ID
+    // pattern/format validity is enforced - not registry existence.
+    const xGtsRefErrors = new XGtsRefValidator().validateInstance(materialized, effectiveSchema);
+    if (xGtsRefErrors.length > 0) {
+      return {
+        id: schemaId,
+        ok: false,
+        error: `x-gts-ref validation failed: ${xGtsRefErrors.map((err) => err.reason).join('; ')}`,
+      };
     }
 
     return { id: schemaId, ok: true, error: '' };
   }
 
-  // OP#13: Entity-level traits validation
-  validateEntityTraits(entityId: string): ValidationResult {
-    const entity = this.get(entityId);
-    if (!entity) {
-      return { id: entityId, ok: false, error: `Entity not found: ${entityId}` };
-    }
+  /**
+   * Checks that the `allOf` composition of the chain's trait-schema branches
+   * leaves every declared trait property expressible (§9.7.5, "if the effective
+   * trait schema cannot be satisfied ... schema validation MUST fail").
+   *
+   * Faithful port of gts-rust's `schema_traits::validate_trait_schema_compatibility`,
+   * which - for each level `i` of the chain - builds `ancestor` and `descendant`
+   * as `{allOf: [...]}` wrappers over the chain prefixes `[0..i)` / `[0..i+1)`
+   * and runs TWO separate checks against them:
+   *
+   *   1. `schema_derivation::validate_closed_descendant_branches` - a raw,
+   *      structural walk (recursing into every shared property, and into the
+   *      descendant's own `allOf`) that finds a closed `allOf` branch, at any
+   *      depth, orphaning a property an earlier branch declared. Ported here
+   *      as `collectClosedBranchOrphanErrors`, fed by `resolveSchemaFully`
+   *      (this file's `flatten_schema` analog) flattening the ancestor
+   *      prefix once per chain level, per gts-rust's own
+   *      `validate_closed_descendant_branches` entry point. Deliberately NOT
+   *      gated on required-ness: orphaning any property via a closed
+   *      conjunct, required or not, always makes that conjunct reject a
+   *      value the other allows.
+   *
+   *   2. `schema_derivation::validate_derivation` - "does the descendant's
+   *      *declared* schema stay included in the ancestor's *declared* schema".
+   *      Ported here via `declaredTraitSchema` (a faithful port of
+   *      `declared_schema`/`absorb_declaration`/`absorb_property`/
+   *      `merge_additional_properties_constraint`) plus the existing, already
+   *      verified `GtsCompatibility.compareSchemas` as the accepted-set-
+   *      inclusion checker (gts-rust's `check_accepted_set_inclusion`). Also
+   *      ports `collect_disabled_base_properties`, the one admission rule
+   *      `validate_derivation` runs alongside inclusion that inclusion itself
+   *      does not express (disabling an inherited property narrows the
+   *      accepted set, so plain subsumption lets it through).
+   *
+   * Returns a description of the first problem found, or null when satisfiable.
+   */
+  private validateTraitChainSatisfiability(traitSchemas: any[]): string | null {
+    // Both checks run per chain level - `ancestor = chain[0..i)`,
+    // `descendant = chain[0..i+1)` - matching gts-rust's own loop
+    // (`validate_trait_schema_compatibility`), rather than over the whole
+    // chain's flattened `allOf` branches at once.
+    for (let i = 1; i < traitSchemas.length; i++) {
+      // 1) Closed-branch orphan check - raw/structural, unconditional on
+      // required-ness (see doc comment above). `ancestorFlat` is the
+      // ancestor prefix flattened ONCE (gts-rust's `flatten_schema`, i.e.
+      // this file's `resolveSchemaFully`); the descendant prefix is passed
+      // RAW so the recursion can walk its own `allOf` directly.
+      const ancestorFlat = this.resolveSchemaFully({ allOf: traitSchemas.slice(0, i) });
+      const descendantRaw = { allOf: traitSchemas.slice(0, i + 1) };
+      const orphanErrors = this.collectClosedBranchOrphanErrors(ancestorFlat, descendantRaw, '', 0);
+      if (orphanErrors.length > 0) {
+        return orphanErrors.join('; ');
+      }
 
-    if (!entity.isSchema) {
-      return { id: entityId, ok: true, error: '' };
-    }
+      // 2) Declared-schema-fold + accepted-set-inclusion check, per chain
+      // level.
+      const ancestorDeclared = this.declaredTraitSchema({ allOf: traitSchemas.slice(0, i) }, 0);
+      const descendantDeclared = this.declaredTraitSchema({ allOf: traitSchemas.slice(0, i + 1) }, 0);
 
-    // Build the chain for this schema
-    const chain = this.buildSchemaChain(entityId);
+      const disabledError = this.findDisabledBaseProperty(ancestorDeclared, descendantDeclared);
+      if (disabledError) {
+        return disabledError;
+      }
 
-    const traitSchemas: any[] = [];
-    let hasTraitValues = false;
-
-    for (const chainSchemaId of chain) {
-      const chainEntity = this.get(chainSchemaId);
-      if (!chainEntity || !chainEntity.content) continue;
-
-      this.collectTraitSchemas(chainEntity.content, traitSchemas);
-
-      const levelTraits: Record<string, any> = {};
-      this.collectTraitValues(chainEntity.content, levelTraits);
-      if (Object.keys(levelTraits).length > 0) {
-        hasTraitValues = true;
+      // `forward`: Valid(descendantDeclared) ⊆ Valid(ancestorDeclared) - the
+      // inclusion direction §9.7.5 requires. Admission fails closed (mirroring
+      // gts-rust's own comment on `validate_derivation`): `unknown` is
+      // rejected exactly like `incompatible`, only `compatible` passes.
+      const { forward } = GtsCompatibility.compareSchemas(this, ancestorDeclared, descendantDeclared);
+      if (forward !== 'compatible') {
+        return `trait-schema level ${i} is not a valid narrowing of the preceding effective trait schema (${forward})`;
       }
     }
 
-    if (traitSchemas.length === 0) {
-      return { id: entityId, ok: true, error: '' };
+    return null;
+  }
+
+  /**
+   * Faithful port of gts-rust's `collect_closed_descendant_branch_errors`
+   * (`schema_derivation.rs`): a descendant branch that closes itself with
+   * `additionalProperties: false` must restate every property the flattened
+   * ancestor declared, or the closed branch rejects a value the ancestor
+   * allows once composed via `allOf` - checked at every depth, not only the
+   * top level, since a closed branch nested inside a shared property's own
+   * value constrains that same object instance just as directly.
+   *
+   * `ancestorFlat` is flattened ONCE by the caller and re-flattened here only
+   * for the property this call recurses into (mirroring gts-rust's own
+   * `flatten_schema(ancestor_prop)` at each level); `descendantRaw` is walked
+   * as authored so its own `allOf` branches are visited directly.
+   */
+  private collectClosedBranchOrphanErrors(
+    ancestorFlat: ResolvedSchema,
+    descendantRaw: any,
+    path: string,
+    depth: number
+  ): string[] {
+    const errors: string[] = [];
+    if (depth >= MAX_SCHEMA_DEPTH) {
+      errors.push(
+        `closed-branch orphan check at '${path || '<root>'}' exceeds ${MAX_SCHEMA_DEPTH} levels and cannot be resolved`
+      );
+      return errors;
+    }
+    if (typeof descendantRaw !== 'object' || descendantRaw === null || Array.isArray(descendantRaw)) {
+      return errors;
     }
 
-    // If trait schemas exist but no trait values, entity is incomplete
-    if (!hasTraitValues) {
-      return {
-        id: entityId,
-        ok: false,
-        error: 'Entity defines x-gts-traits-schema but no x-gts-traits values are provided',
-      };
+    const ancestorProps = ancestorFlat.properties || {};
+    const descendantProps: Record<string, any> = descendantRaw.properties || {};
+
+    if (descendantRaw.additionalProperties === false) {
+      const orphaned = Object.keys(ancestorProps)
+        .filter((name) => ancestorProps[name] !== false && !(name in descendantProps))
+        .sort();
+      for (const name of orphaned) {
+        const fullPath = path ? `${path}.${name}` : name;
+        errors.push(
+          `Property '${fullPath}' is declared in a preceding trait-schema branch but excluded by additionalProperties: false`
+        );
+      }
     }
 
-    // Each trait schema must have additionalProperties: false (closed)
-    for (const ts of traitSchemas) {
-      if (typeof ts === 'object' && ts !== null) {
-        if (ts.additionalProperties !== false) {
-          return {
-            id: entityId,
-            ok: false,
-            error: 'Trait schema must set additionalProperties: false for entity validation',
-          };
+    const commonNames = Object.keys(descendantProps)
+      .filter((name) => name in ancestorProps)
+      .sort();
+    for (const name of commonNames) {
+      const nextAncestorFlat = this.resolveSchemaFully(ancestorProps[name]);
+      const nextPath = path ? `${path}.${name}` : name;
+      errors.push(
+        ...this.collectClosedBranchOrphanErrors(nextAncestorFlat, descendantProps[name], nextPath, depth + 1)
+      );
+    }
+
+    if (Array.isArray(descendantRaw.allOf)) {
+      for (const item of descendantRaw.allOf) {
+        errors.push(...this.collectClosedBranchOrphanErrors(ancestorFlat, item, path, depth + 1));
+      }
+    }
+
+    return errors;
+  }
+
+  /**
+   * Faithful port of gts-rust's `collect_disabled_base_properties`: rejects a
+   * descendant trait-schema level that switches an ancestor-declared property
+   * off with `false`. Plain accepted-set inclusion permits this (rejecting
+   * every instance that carries the property keeps the descendant's accepted
+   * set inside the ancestor's), but disabling an inherited property is not a
+   * valid narrowing of the trait-schema chain, so this is a separate
+   * admission rule rather than a compatibility one.
+   */
+  private findDisabledBaseProperty(ancestorDeclared: any, descendantDeclared: any): string | null {
+    const ancestorProps =
+      ancestorDeclared && typeof ancestorDeclared === 'object' ? ancestorDeclared.properties || {} : {};
+    const descendantProps =
+      descendantDeclared && typeof descendantDeclared === 'object' ? descendantDeclared.properties || {} : {};
+    for (const [name, property] of Object.entries(descendantProps)) {
+      if (property === false && ancestorProps[name] !== undefined) {
+        return `property '${name}': trait-schema disables a property defined by a preceding trait-schema level`;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Faithful port of gts-rust's `declared_schema`/`absorb_declaration` (see
+   * `schema_derivation.rs`): reduces a schema to what it *declares*, folding
+   * `allOf` branches in order so that a later declaration of a property's own
+   * (non-structural) keywords replaces earlier ones - a level that restates a
+   * property redeclares that property's value constraints outright, it does
+   * not intersect with what came before. Object structure (`properties`,
+   * `required`, `additionalProperties`) composes instead, via `absorbProperty`
+   * / `mergeAdditionalPropertiesConstraint`.
+   *
+   * Below `MAX_SCHEMA_DEPTH` the schema is returned as authored, matching
+   * gts-rust's own fail-closed choice: an unreduced declaration reads as
+   * looser than it is to the inclusion checker, so recursing further would
+   * only affect how conservative the rejection is, never turn a real problem
+   * into a false pass.
+   */
+  private declaredTraitSchema(schema: any, depth: number = 0): any {
+    if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+      return schema;
+    }
+    if (depth >= MAX_SCHEMA_DEPTH) {
+      return schema;
+    }
+
+    const declared: Record<string, any> = {};
+    const additionalProperties: { value?: any } = {};
+
+    if (Array.isArray(schema.allOf)) {
+      for (const branch of schema.allOf) {
+        const declaredBranch = this.declaredTraitSchema(branch, depth + 1);
+        if (typeof declaredBranch === 'object' && declaredBranch !== null && !Array.isArray(declaredBranch)) {
+          this.absorbDeclaration(declared, additionalProperties, declaredBranch, depth);
         }
       }
     }
+    this.absorbDeclaration(declared, additionalProperties, schema, depth);
 
-    return { id: entityId, ok: true, error: '' };
+    if ('value' in additionalProperties) {
+      declared.additionalProperties = additionalProperties.value;
+    }
+
+    return declared;
+  }
+
+  /** Folds one declaration level into the accumulated one (see `declaredTraitSchema`). */
+  private absorbDeclaration(
+    declared: Record<string, any>,
+    additionalProperties: { value?: any },
+    source: Record<string, any>,
+    depth: number
+  ): void {
+    for (const [keyword, value] of Object.entries(source)) {
+      switch (keyword) {
+        case 'allOf':
+          break;
+        case 'additionalProperties':
+          this.mergeAdditionalPropertiesConstraint(additionalProperties, value);
+          break;
+        case 'properties': {
+          if (typeof value !== 'object' || value === null || Array.isArray(value)) break;
+          const target: Record<string, any> = (declared.properties = declared.properties || {});
+          for (const [name, property] of Object.entries(value)) {
+            const resolvedProperty = this.declaredTraitSchema(property, depth + 1);
+            if (target[name] !== undefined) {
+              this.absorbProperty(target, name, resolvedProperty, depth + 1);
+            } else {
+              target[name] = resolvedProperty;
+            }
+          }
+          break;
+        }
+        case 'required': {
+          if (!Array.isArray(value)) break;
+          const target: string[] = (declared.required = declared.required || []);
+          for (const name of value) {
+            if (!target.includes(name)) target.push(name);
+          }
+          break;
+        }
+        default:
+          // Later declaration of the same keyword wins (overwrite).
+          declared[keyword] = value;
+      }
+    }
+  }
+
+  /**
+   * Faithful port of gts-rust's `absorb_property`: folds an overlay's
+   * declaration of a property into the one inherited from an earlier `allOf`
+   * branch. The overlay's own non-structural keywords replace the inherited
+   * ones wholesale (a restated property redeclares its value constraints, it
+   * does not inherit an unrestated bound), while `properties`/`required`/
+   * `additionalProperties` compose structurally by re-folding the overlay's
+   * own structural keys on top of the inherited ones via `absorbDeclaration`.
+   */
+  private absorbProperty(target: Record<string, any>, name: string, overlay: any, depth: number): void {
+    const inherited = target[name];
+    const inheritedIsObject = typeof inherited === 'object' && inherited !== null && !Array.isArray(inherited);
+    const overlayIsObject = typeof overlay === 'object' && overlay !== null && !Array.isArray(overlay);
+
+    if (depth >= MAX_SCHEMA_DEPTH || !inheritedIsObject || !overlayIsObject) {
+      target[name] = overlay;
+      return;
+    }
+
+    const composed: Record<string, any> = {};
+    for (const [keyword, value] of Object.entries(overlay)) {
+      if (!TRAIT_STRUCTURAL_KEYWORDS.includes(keyword)) {
+        composed[keyword] = value;
+      }
+    }
+
+    const additionalProperties: { value?: any } = {};
+    if (inherited.additionalProperties !== undefined) {
+      additionalProperties.value = inherited.additionalProperties;
+    }
+    for (const keyword of ['properties', 'required']) {
+      if (inherited[keyword] !== undefined) {
+        composed[keyword] = inherited[keyword];
+      }
+    }
+
+    this.absorbDeclaration(composed, additionalProperties, overlay, depth);
+
+    if ('value' in additionalProperties) {
+      composed.additionalProperties = additionalProperties.value;
+    }
+
+    target[name] = composed;
+  }
+
+  /**
+   * Faithful port of gts-rust's `merge_additional_properties_constraint`: a
+   * closedness-preserving lattice over `additionalProperties` values - a
+   * schema equivalent to `false` (closed) always wins, a schema equivalent to
+   * `true` (open) never overrides an existing constraint, and anything else
+   * replaces the accumulated value. Mirrors `allOf` composition, where the
+   * level stays closed if ANY branch gives `additionalProperties` a
+   * false-equivalent schema, so a permissive overlay can never loosen a
+   * closed ancestor.
+   */
+  private mergeAdditionalPropertiesConstraint(accumulated: { value?: any }, candidate: any): void {
+    const currentBool = 'value' in accumulated ? this.schemaBooleanValue(accumulated.value) : undefined;
+    if (currentBool === false) return; // already closed, stays closed
+    const candidateBool = this.schemaBooleanValue(candidate);
+    if (candidateBool === true && 'value' in accumulated) return; // intersecting with `true` changes nothing
+    accumulated.value = candidate;
+  }
+
+  /** `true`/`false` when `schema` is boolean-equivalent, `undefined` otherwise. */
+  private schemaBooleanValue(schema: any): boolean | undefined {
+    if (schema === false) return false;
+    if (isEmptySchema(schema)) return true;
+    return undefined;
+  }
+
+  /**
+   * Returns a description when the `const` / `enum` value sets across
+   * subschemas leave no value that satisfies every branch.
+   */
+  private findValueConflict(subSchemas: any[]): string | null {
+    let allowed: any[] | null = null;
+    const seen: string[] = [];
+
+    for (const subSchema of subSchemas) {
+      if (typeof subSchema !== 'object' || subSchema === null) continue;
+
+      let values: any[] | null = null;
+      if ('const' in subSchema) values = [subSchema.const];
+      else if (Array.isArray(subSchema.enum)) values = subSchema.enum;
+      if (values === null) continue;
+
+      seen.push(JSON.stringify(values));
+      if (allowed === null) {
+        allowed = values;
+        continue;
+      }
+      allowed = allowed.filter((a) => values.some((b) => JSON.stringify(a) === JSON.stringify(b)));
+      if (allowed.length === 0) {
+        return `no value satisfies every declared const/enum (${seen.join(' vs ')})`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * JSON Merge Patch (RFC 7396): objects merge recursively, every other value
+   * replaces wholesale, and a `null` deletes the key.
+   */
+  private applyMergePatch(target: Record<string, any>, patch: Record<string, any>): Record<string, any> {
+    const result: Record<string, any> = { ...target };
+
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === null) {
+        delete result[key];
+        continue;
+      }
+      if (typeof value === 'object' && !Array.isArray(value)) {
+        const current = result[key];
+        const base = typeof current === 'object' && current !== null && !Array.isArray(current) ? current : {};
+        result[key] = this.applyMergePatch(base, value);
+        continue;
+      }
+      result[key] = value;
+    }
+
+    return result;
   }
 
   // Build the schema chain from base to leaf for a given schema ID
+  /**
+   * The document-level GTS rules for a type schema (§9.7.1, §9.11), in one
+   * place so that every entry point enforces the same set.
+   *
+   * A malformed modifier declaration always fails: the document cannot be
+   * interpreted at all. The remaining rules are the "guards" of §9.11.5 - they
+   * run when validation is enabled at registration, and unconditionally on the
+   * explicit validation endpoints.
+   *
+   * Returns an error message, or null when the document passes.
+   */
+  checkTypeSchemaRules(content: any, id: string | undefined, options: { enforceGuards: boolean }): string | null {
+    const declarationError = GtsModifiers.validateDeclaration(content);
+    if (declarationError) {
+      return declarationError;
+    }
+
+    if (!options.enforceGuards) {
+      return null;
+    }
+
+    const misplaced = GtsModifiers.findMisplacedKeywords(content);
+    if (misplaced.length > 0) {
+      return `document-level GTS keywords must appear at the schema top level; found at: ${misplaced.join(', ')}`;
+    }
+
+    // `register()` rejects a malformed id up front, so `findFinalBaseInChain`
+    // should never actually throw here; the catch only keeps this
+    // string-or-null-returning check from turning into an uncaught exception
+    // if that invariant is ever violated.
+    let finalBase: string | null;
+    try {
+      finalBase = id ? this.findFinalBaseInChain(id) : null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    if (finalBase) {
+      return `base type '${finalBase}' is final and cannot be extended`;
+    }
+
+    return null;
+  }
+
+  /**
+   * The document-level GTS rule for an instance: its rightmost type must be
+   * instantiable (§9.11.3 item 1). Returns an error message, or null.
+   */
+  checkInstanceRules(typeId: string | null | undefined): string | null {
+    if (typeId && this.isAbstractType(typeId)) {
+      return `Type '${typeId}' is abstract and cannot be directly instantiated`;
+    }
+    return null;
+  }
+
+  /**
+   * Returns the id of the first base type in the `$id` chain of `schemaId` that
+   * is marked `x-gts-final`, or null when the chain is derivable (§9.11.2).
+   *
+   * Determined from the chained `$id` alone, so it holds regardless of whether
+   * the derived body uses `allOf` + `$ref` or restates the parent's fields.
+   * Only proper ancestors are considered: a type being final does not
+   * invalidate itself.
+   */
+  findFinalBaseInChain(schemaId: string): string | null {
+    const chain = this.buildSchemaChain(schemaId);
+    for (const baseId of chain.slice(0, -1)) {
+      const baseEntity = this.get(baseId);
+      if (baseEntity && baseEntity.isSchema && GtsModifiers.isFinal(baseEntity.content)) {
+        return baseId;
+      }
+    }
+    return null;
+  }
+
+  /** True when `typeId` resolves to a registered type marked `x-gts-abstract` (§9.11.3). */
+  isAbstractType(typeId: string): boolean {
+    const normalized = typeId.startsWith(GTS_URI_PREFIX) ? typeId.substring(GTS_URI_PREFIX.length) : typeId;
+    const entity = this.get(normalized);
+    return !!entity && entity.isSchema && GtsModifiers.isAbstract(entity.content);
+  }
+
   private buildSchemaChain(schemaId: string): string[] {
     // Parse the schema ID to get segments
     try {
@@ -1394,44 +1550,47 @@ export class GtsStore {
       }
 
       return chain;
-    } catch {
-      return [schemaId];
-    }
-  }
-
-  // Collect x-gts-traits-schema from a schema content (recursing into allOf)
-  private collectTraitSchemas(content: any, out: any[], depth: number = 0): void {
-    if (depth > 64 || typeof content !== 'object' || content === null) return;
-
-    if (content['x-gts-traits-schema'] !== undefined) {
-      out.push(content['x-gts-traits-schema']);
-    }
-
-    if (Array.isArray(content.allOf)) {
-      for (const item of content.allOf) {
-        this.collectTraitSchemas(item, out, depth + 1);
-      }
-    }
-  }
-
-  // Collect x-gts-traits from a schema content (recursing into allOf)
-  private collectTraitValues(content: any, merged: Record<string, any>, depth: number = 0): void {
-    if (depth > 64 || typeof content !== 'object' || content === null) return;
-
-    if (typeof content['x-gts-traits'] === 'object' && content['x-gts-traits'] !== null) {
-      Object.assign(merged, content['x-gts-traits']);
-    }
-
-    if (Array.isArray(content.allOf)) {
-      for (const item of content.allOf) {
-        this.collectTraitValues(item, merged, depth + 1);
-      }
+    } catch (err) {
+      // Returning a truncated (or single-element) chain would silently hide
+      // every ancestor of `schemaId` from the caller, which then fails open
+      // by treating the entity as if it had no parent/trait-schema/final-base
+      // ancestors at all - so, like `resolveTraitSchemaRefs`'s depth guard
+      // above, the caller is told instead of being handed a permissive
+      // fallback. `register()` rejects malformed ids up front, so this
+      // should be unreachable in practice.
+      throw new Error(`Cannot build schema chain for '${schemaId}': ${err instanceof Error ? err.message : err}`);
     }
   }
 
   // Resolve $ref inside a trait schema, detecting cycles
-  private resolveTraitSchemaRefs(schema: any, visited: Set<string>, depth: number = 0): any {
-    if (depth > 64) return schema;
+  //
+  // `pathBudget` bounds the total number of `$ref` follows and `allOf` branch
+  // recursions taken across the whole top-level call, not just the depth of
+  // any one chain. `MAX_SCHEMA_DEPTH` alone only bounds how deep a single
+  // chain can go; it does nothing to stop a diamond-shaped `allOf`/`$ref`
+  // DAG (level N reaching both level N-1 and N-2, which themselves both
+  // reach a shared ancestor) from being walked once per root-to-leaf path
+  // through it - a count that doubles per level and can reach the millions
+  // within `MAX_SCHEMA_DEPTH`. This function's own tree-walk is cheap even
+  // at that path count (well under a second - see the shared MAX_SCHEMA_PATHS'
+  // budget below), but the resulting *inlined* schema handed to Ajv is not:
+  // Ajv's compiled validator has one function-call node per occurrence, so
+  // validating even a single instance against it becomes exponential too.
+  // A mutable holder (rather than a primitive `count`) is used so every
+  // recursive call increments the SAME counter, matching how `visited` is
+  // threaded per-path but in the opposite sense - shared across all paths,
+  // not cloned per branch.
+  private resolveTraitSchemaRefs(
+    schema: any,
+    visited: Set<string>,
+    depth: number = 0,
+    pathBudget: { count: number } = { count: 0 }
+  ): any {
+    // Returning the unresolved schema would silently drop the constraints
+    // behind the remaining refs, so the caller is told instead.
+    if (depth > MAX_SCHEMA_DEPTH) {
+      throw new Error(`x-gts-traits-schema nests deeper than ${MAX_SCHEMA_DEPTH} levels and cannot be resolved`);
+    }
     if (typeof schema !== 'object' || schema === null) return schema;
 
     const result: any = {};
@@ -1441,16 +1600,30 @@ export class GtsStore {
         const refUri = value as string;
         const refId = refUri.startsWith(GTS_URI_PREFIX) ? refUri.substring(GTS_URI_PREFIX.length) : refUri;
 
+        // `visited` tracks the active recursion path, not every reference seen
+        // anywhere: two siblings may legitimately point at the same trait
+        // schema, and only a reference back into its own ancestry is a cycle.
         if (visited.has(refId)) {
           throw new Error(`Cyclic reference detected in trait schema: ${refId}`);
         }
-        visited.add(refId);
+
+        pathBudget.count++;
+        if (pathBudget.count > MAX_SCHEMA_PATHS) {
+          throw new Error(
+            `x-gts-traits-schema reference graph has too many composition paths (exceeds ${MAX_SCHEMA_PATHS}) and cannot be resolved`
+          );
+        }
 
         const refEntity = this.get(refId);
         if (!refEntity || !refEntity.content) {
           throw new Error(`Unresolvable trait schema reference: ${refUri}`);
         }
-        const resolved = this.resolveTraitSchemaRefs(refEntity.content, visited, depth + 1);
+        const resolved = this.resolveTraitSchemaRefs(
+          refEntity.content,
+          new Set(visited).add(refId),
+          depth + 1,
+          pathBudget
+        );
         // Merge resolved content into result
         for (const [rk, rv] of Object.entries(resolved)) {
           if (rk !== '$id' && rk !== '$$id' && rk !== '$schema' && rk !== '$$schema') {
@@ -1461,9 +1634,18 @@ export class GtsStore {
       }
 
       if (key === 'allOf' && Array.isArray(value)) {
-        result.allOf = (value as any[]).map((item) => this.resolveTraitSchemaRefs(item, visited, depth + 1));
+        // Each branch gets its own path, so sibling branches may reuse a ref.
+        result.allOf = (value as any[]).map((item) => {
+          pathBudget.count++;
+          if (pathBudget.count > MAX_SCHEMA_PATHS) {
+            throw new Error(
+              `x-gts-traits-schema reference graph has too many composition paths (exceeds ${MAX_SCHEMA_PATHS}) and cannot be resolved`
+            );
+          }
+          return this.resolveTraitSchemaRefs(item, new Set(visited), depth + 1, pathBudget);
+        });
       } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-        result[key] = this.resolveTraitSchemaRefs(value, new Set(visited), depth + 1);
+        result[key] = this.resolveTraitSchemaRefs(value, new Set(visited), depth + 1, pathBudget);
       } else {
         result[key] = value;
       }
@@ -1473,40 +1655,174 @@ export class GtsStore {
   }
 
   // Apply defaults from trait schema to trait values
-  private applyTraitDefaults(schema: any, traits: Record<string, any>): Record<string, any> {
-    const result = { ...traits };
-    const props = this.collectAllTraitProperties(schema);
+  /**
+   * Materializes trait-schema `default`s into the effective traits object
+   * before the completeness check (§9.7.5, ADR-0003).
+   *
+   * Recursive: a default declared on a nested trait property is materialized
+   * too, provided its containing object is present or itself materialized.
+   * Applying only top-level defaults left `routing.topic` unresolved and the
+   * completeness check then failed on a trait the schema had already answered.
+   */
+  private applyTraitDefaults(schema: any, traits: Record<string, any>, depth: number = 0): Record<string, any> {
+    if (depth > MAX_SCHEMA_DEPTH) return traits;
 
-    for (const [propName, propSchema] of Object.entries(props)) {
-      if (!(propName in result) && typeof propSchema === 'object' && propSchema !== null && 'default' in propSchema) {
+    const result = { ...traits };
+    const { properties, required } = this.collectTraitSurface(schema);
+
+    for (const [propName, propSchema] of Object.entries(properties)) {
+      if (typeof propSchema !== 'object' || propSchema === null) continue;
+
+      // Already carries a value: fill in whatever its own subtree defaults.
+      if (propName in result) {
+        const current = result[propName];
+        if (typeof current === 'object' && current !== null && !Array.isArray(current)) {
+          result[propName] = this.applyTraitDefaults(propSchema, current, depth + 1);
+        }
+        continue;
+      }
+
+      if ('default' in propSchema) {
         result[propName] = propSchema.default;
+        continue;
+      }
+
+      // No `default` of its own. ADR-0003 licenses materializing defaults, not
+      // inventing values, so an absent *optional* object stays absent -
+      // conjuring one would validate a subtree the author never supplied and
+      // could fail a type that is legitimately incomplete there. An absent
+      // *required* object is filled from its subtree; whatever the subtree
+      // cannot supply is then a genuine completeness failure.
+      if (required.has(propName)) {
+        const nested = this.applyTraitDefaults(propSchema, {}, depth + 1);
+        if (Object.keys(nested).length > 0) result[propName] = nested;
       }
     }
 
     return result;
   }
 
-  // Collect all properties from a trait schema (handling allOf composition)
-  private collectAllTraitProperties(schema: any, depth: number = 0): Record<string, any> {
-    const props: Record<string, any> = {};
-    if (depth > 64 || typeof schema !== 'object' || schema === null) return props;
+  /**
+   * The declared surface of a trait schema at one level - its properties and
+   * which of them are required - with `allOf` branches merged in.
+   *
+   * Both are collected together so that a caller can never read a merged
+   * property list against a stale or differently-merged `required` list.
+   *
+   * A property can be redeclared by more than one contributing branch (the
+   * schema's own `properties` and each `allOf` branch, recursively) - real
+   * `allOf` semantics require a value to satisfy every branch independently,
+   * not just the last one written, so merging by wholesale-replacing an
+   * earlier branch's subschema with a later one silently drops whatever the
+   * earlier branch declared and the later branch did not repeat (most
+   * notably `default`). Every branch's subschema for a name is accumulated
+   * and combined via `mergeTraitPropertySchemas` instead.
+   */
+  private collectTraitSurface(
+    schema: any,
+    depth: number = 0
+  ): { properties: Record<string, any>; required: Set<string> } {
+    const { declaredBy, required } = this.collectTraitDeclarations(schema, depth);
+
+    const properties: Record<string, any> = {};
+    for (const [name, subSchemas] of declaredBy) {
+      properties[name] = subSchemas.length === 1 ? subSchemas[0] : this.mergeTraitPropertySchemas(subSchemas);
+    }
+
+    return { properties, required };
+  }
+
+  /**
+   * The raw, per-branch-unmerged form `collectTraitSurface` collapses into
+   * its `properties` map: every subschema any branch (recursively through
+   * its own `allOf`) declares for a property name, kept as separate list
+   * entries rather than merged into one value.
+   *
+   * `collectTraitSurface` collapses this for `applyTraitDefaults`, which only
+   * ever needs one schema per name to read `default` from and recurse into.
+   * (Trait-schema chain *satisfiability* is a separate concern, answered by
+   * `validateTraitChainSatisfiability` via `resolveSchemaFully` /
+   * `compareOverlayToBase` instead of this flattening.)
+   */
+  private collectTraitDeclarations(
+    schema: any,
+    depth: number = 0
+  ): { declaredBy: Map<string, any[]>; required: Set<string> } {
+    const declaredBy = new Map<string, any[]>();
+    const required = new Set<string>();
+    if (depth > MAX_SCHEMA_DEPTH || typeof schema !== 'object' || schema === null) {
+      return { declaredBy, required };
+    }
+
+    const addBranchProperties = (props: Record<string, any>) => {
+      for (const [name, subSchema] of Object.entries(props)) {
+        const existing = declaredBy.get(name);
+        if (existing) existing.push(subSchema);
+        else declaredBy.set(name, [subSchema]);
+      }
+    };
 
     if (typeof schema.properties === 'object' && schema.properties !== null) {
-      Object.assign(props, schema.properties);
+      addBranchProperties(schema.properties);
+    }
+    if (Array.isArray(schema.required)) {
+      for (const name of schema.required) {
+        if (typeof name === 'string') required.add(name);
+      }
     }
 
     if (Array.isArray(schema.allOf)) {
       for (const item of schema.allOf) {
-        Object.assign(props, this.collectAllTraitProperties(item, depth + 1));
+        const branch = this.collectTraitDeclarations(item, depth + 1);
+        for (const [name, subSchemas] of branch.declaredBy) {
+          const existing = declaredBy.get(name);
+          if (existing) existing.push(...subSchemas);
+          else declaredBy.set(name, [...subSchemas]);
+        }
+        for (const name of branch.required) required.add(name);
       }
     }
 
-    return props;
+    return { declaredBy, required };
+  }
+
+  /**
+   * Combines more than one branch's subschema for the same property name
+   * into one schema that `applyTraitDefaults` can read.
+   *
+   * `applyTraitDefaults` looks for a `default` directly on the property
+   * schema it's given, then recurses into that same schema as a sub-schema
+   * for nested properties/required. Wrapping the branches in `{ allOf: [...] }`
+   * gives the recursive call everything it needs (nested `properties` and
+   * `required` still resolve correctly, since `collectTraitSurface` already
+   * knows how to flatten `allOf`); the one piece `allOf` doesn't surface for
+   * a direct read is `default`, so it's hoisted onto the wrapper too.
+   *
+   * `subSchemas` is built root-to-leaf (the chain walk that produces
+   * `traitSchemas` runs from the base schema down to the leaf), so when more
+   * than one branch declares a `default` for the same property, the LAST
+   * match is the most-derived (descendant) declaration. That's the one that
+   * wins, consistent with the descendant-overrides-ancestor convention used
+   * everywhere else in this file (e.g. `applyMergePatch`'s RFC 7396
+   * last-wins merge) - a descendant redeclaring a property's default is
+   * meant to override its ancestor's, not the other way around.
+   */
+  private mergeTraitPropertySchemas(subSchemas: any[]): any {
+    const withDefault = [...subSchemas].reverse().find((s) => typeof s === 'object' && s !== null && 'default' in s);
+    const merged: any = { allOf: subSchemas };
+    if (withDefault) merged.default = withDefault.default;
+    return merged;
   }
 
   // Detect cyclic $$ref/$ref references reachable from a schema's content
   private detectRefCycle(originId: string, content: any, visited: Set<string>, depth: number = 0): string | null {
-    if (depth > 64 || !content || typeof content !== 'object') return null;
+    // Fail closed, and separately from the non-object base case: `null` means
+    // "no cycle here", so returning it on overflow would let a cycle that sits
+    // below the limit pass unexamined.
+    if (depth > MAX_SCHEMA_DEPTH) {
+      return `reference chain from '${originId}' exceeds ${MAX_SCHEMA_DEPTH} levels and cannot be checked for cycles`;
+    }
+    if (!content || typeof content !== 'object') return null;
 
     // Check direct ref on this object
     const ref = content['$$ref'] || content['$ref'];
@@ -1517,16 +1833,19 @@ export class GtsStore {
       }
       const refEntity = this.get(refId);
       if (refEntity && refEntity.content) {
-        visited.add(refId);
-        const inner = this.detectRefCycle(originId, refEntity.content, visited, depth + 1);
+        // Same rule as resolveTraitSchemaRefs: `visited` is the active
+        // recursion path, so following a ref extends a copy of it. Sharing one
+        // set across siblings reports ordinary reuse of a common schema as a
+        // cycle.
+        const inner = this.detectRefCycle(originId, refEntity.content, new Set(visited).add(refId), depth + 1);
         if (inner) return inner;
       }
     }
 
-    // Recurse into allOf
+    // Recurse into allOf - each branch is its own path.
     if (Array.isArray(content.allOf)) {
       for (const sub of content.allOf) {
-        const inner = this.detectRefCycle(originId, sub, visited, depth + 1);
+        const inner = this.detectRefCycle(originId, sub, new Set(visited), depth + 1);
         if (inner) return inner;
       }
     }
@@ -1534,19 +1853,51 @@ export class GtsStore {
     return null;
   }
 
-  private findParentRef(schema: any): string | null {
-    if (!schema || !schema.allOf || !Array.isArray(schema.allOf)) {
-      return null;
+  /**
+   * Every `$ref` / `$$ref` this schema declares directly - at the top level or
+   * in an `allOf` branch.
+   *
+   * The top level counts: `{"$ref": parent}` is a valid JSON Schema way to say
+   * "identical to the parent", and ADR-0001 leaves the derivation body free, so
+   * a derived type written that way inherits just as much as an `allOf` one.
+   */
+  private collectDirectRefs(schema: any): string[] {
+    if (!schema || typeof schema !== 'object') {
+      return [];
     }
-    for (const sub of schema.allOf) {
-      if (sub && typeof sub === 'object') {
-        const ref = sub['$$ref'] || sub['$ref'];
-        if (typeof ref === 'string') {
-          return ref;
+
+    const refs: string[] = [];
+    const own = schema['$$ref'] || schema['$ref'];
+    if (typeof own === 'string') {
+      refs.push(own);
+    }
+
+    if (Array.isArray(schema.allOf)) {
+      for (const sub of schema.allOf) {
+        if (sub && typeof sub === 'object') {
+          const ref = sub['$$ref'] || sub['$ref'];
+          if (typeof ref === 'string') {
+            refs.push(ref);
+          }
         }
       }
     }
-    return null;
+    return refs;
+  }
+
+  /**
+   * True when the derived body pulls its chain parent in through `allOf` +
+   * `$ref`, so the parent's constraints keep applying to the same instance.
+   *
+   * A reference to some unrelated type does not count: the parent's
+   * constraints would not be inherited, so the derived body still has to
+   * restate them (ADR-0001 variant 2c).
+   */
+  private inheritsParentViaRef(schema: any, parentId: string): boolean {
+    return this.collectDirectRefs(schema).some((ref) => {
+      const normalized = ref.startsWith(GTS_URI_PREFIX) ? ref.substring(GTS_URI_PREFIX.length) : ref;
+      return normalized === parentId;
+    });
   }
 
   private resolveSchemaFully(schema: any, visited: Set<string> = new Set()): ResolvedSchema {
@@ -1556,6 +1907,28 @@ export class GtsStore {
       additionalProperties: undefined,
       type: schema.type,
     };
+
+    // A top-level `$ref` carries the whole referenced schema, exactly as an
+    // `allOf` branch does; without this a parent written that way resolves to
+    // nothing and its constraints become unenforceable for descendants.
+    const ownRef = schema['$$ref'] || schema['$ref'];
+    if (typeof ownRef === 'string') {
+      const refId = ownRef.startsWith(GTS_URI_PREFIX) ? ownRef.substring(GTS_URI_PREFIX.length) : ownRef;
+      if (!visited.has(refId)) {
+        const refEntity = this.get(refId);
+        if (refEntity && refEntity.content) {
+          const resolved = this.resolveSchemaFully(refEntity.content, new Set(visited).add(refId));
+          Object.assign(result.properties, resolved.properties);
+          result.required.push(...(resolved.required || []));
+          if (resolved.additionalProperties !== undefined) {
+            result.additionalProperties = resolved.additionalProperties;
+          }
+          if (resolved.type && !result.type) {
+            result.type = resolved.type;
+          }
+        }
+      }
+    }
 
     // If this schema has allOf, resolve each part
     if (schema.allOf && Array.isArray(schema.allOf)) {
@@ -1700,7 +2073,22 @@ export class GtsStore {
     return overlay;
   }
 
-  private compareOverlayToBase(overlay: ResolvedSchema, baseResolved: ResolvedSchema, path: string): string[] {
+  /**
+   * Compares a derived schema's overlay against its resolved base (§3.1, §4.1).
+   *
+   * `inheritsViaRef` says whether the derived body pulls the base in through
+   * `allOf` + `$ref`. When it does, the base branch keeps applying to the same
+   * instance, so the overlay cannot loosen anything by omission - only by
+   * excluding values the base allows. When the derived body instead restates
+   * the parent's fields (ADR-0001 variant 2c), anything it fails to restate is
+   * a genuine loosening.
+   */
+  private compareOverlayToBase(
+    overlay: ResolvedSchema,
+    baseResolved: ResolvedSchema,
+    path: string,
+    inheritsViaRef: boolean = true
+  ): string[] {
     const errors: string[] = [];
     const overlayProps = overlay.properties || {};
     const baseProps = baseResolved.properties || {};
@@ -1734,27 +2122,66 @@ export class GtsStore {
 
       // Both base and overlay have this property — compare constraints
       if (typeof propSchema === 'object' && propSchema !== null) {
-        errors.push(...this.comparePropertyConstraints(propSchema, baseProp, propPath));
+        errors.push(...this.comparePropertyConstraints(propSchema, baseProp, propPath, inheritsViaRef));
       }
     }
 
-    // Check additionalProperties
-    if (baseResolved.additionalProperties === false) {
-      if (overlay.additionalProperties === true) {
+    // A derived level that closes itself must restate the base's properties:
+    // under allOf the closed branch is evaluated on its own and would reject
+    // every value the base declares but the derived omits.
+    if (overlay.additionalProperties === false) {
+      for (const propName of Object.keys(baseProps)) {
+        if (baseProps[propName] === false) continue;
+        if (!(propName in overlayProps)) {
+          const propPath = path ? `${path}.${propName}` : propName;
+          errors.push(`Property '${propPath}' is declared in base but excluded by additionalProperties: false`);
+        }
+      }
+    }
+
+    if (!inheritsViaRef) {
+      // The derived schema stands alone, so it must carry the base's
+      // constraints itself rather than inherit them through a $ref.
+      if (baseResolved.additionalProperties === false && overlay.additionalProperties !== false) {
         errors.push('Cannot loosen additionalProperties from false to true');
-      } else if (overlay.additionalProperties === undefined) {
-        errors.push('Base has additionalProperties: false but derived does not restate it');
+      }
+
+      const overlayRequired = new Set(overlay.required || []);
+      for (const requiredProp of baseResolved.required || []) {
+        if (!overlayRequired.has(requiredProp)) {
+          const propPath = path ? `${path}.${requiredProp}` : requiredProp;
+          errors.push(`Property '${propPath}' is required in base but not in derived`);
+        }
       }
     }
 
     return errors;
   }
 
-  private comparePropertyConstraints(derived: any, base: any, propPath: string): string[] {
+  private comparePropertyConstraints(
+    derived: any,
+    base: any,
+    propPath: string,
+    inheritsViaRef: boolean = true
+  ): string[] {
     const errors: string[] = [];
 
     if (typeof base !== 'object' || base === null) {
       return errors;
+    }
+
+    // Cross-keyword conflicts: the loosening/drop checks below only compare
+    // the SAME keyword between `derived` and `base` (e.g. `maximum` vs
+    // `maximum`), so they cannot see a conflict between DIFFERENT keywords
+    // declared by the two sides on the same property - e.g. `derived`
+    // declares `maximum: 5` while `base` already declared `minimum: 10`: no
+    // value satisfies both, but nothing above compares `minimum` against
+    // `maximum`. `findValueConflict`/`findCrossedBound` check whether a SET
+    // of sibling subschemas has a non-empty joint value-set/bound-range
+    // intersection, which is exactly this question.
+    const crossKeywordConflict = this.findValueConflict([derived, base]) || findCrossedBound([derived, base]);
+    if (crossKeywordConflict) {
+      errors.push(`Property '${propPath}' cannot be satisfied: ${crossKeywordConflict}`);
     }
 
     // Type check
@@ -1886,7 +2313,7 @@ export class GtsStore {
           errors.push(`Property '${propPath}' drops constraint 'items'`);
         }
       } else if (typeof base.items === 'object' && typeof derived.items === 'object') {
-        errors.push(...this.comparePropertyConstraints(derived.items, base.items, `${propPath}.items`));
+        errors.push(...this.comparePropertyConstraints(derived.items, base.items, `${propPath}.items`, inheritsViaRef));
       }
     }
 
@@ -1903,7 +2330,7 @@ export class GtsStore {
           required: base.required || [],
           additionalProperties: base.additionalProperties,
         };
-        errors.push(...this.compareOverlayToBase(nestedOverlay, nestedBase, propPath));
+        errors.push(...this.compareOverlayToBase(nestedOverlay, nestedBase, propPath, inheritsViaRef));
       }
     }
 
@@ -2000,9 +2427,9 @@ export function createJsonEntity(content: any, _config?: Partial<GtsConfig>): Js
 
   return {
     id: extractResult.id,
-    schemaId: extractResult.schema_id,
+    schemaId: extractResult.type_id,
     content,
-    isSchema: extractResult.is_schema,
+    isSchema: extractResult.is_type_schema,
     references,
   };
 }
