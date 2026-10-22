@@ -88,6 +88,7 @@ export class GtsStore {
   // to resolve the `/$id` self-reference during combinator resolution. Set only
   // for the duration of a single synchronous `validate(...)` call.
   private currentSelectedTypeId: string | undefined;
+  private readonly normalizedSchemaCache = new Map<string, any>();
   private sortedIds: string[] | undefined;
 
   constructor(config?: Partial<GtsConfig>) {
@@ -118,10 +119,25 @@ export class GtsStore {
   }
 
   private removeEngineSchema(id: string): void {
+    this.normalizedSchemaCache.clear();
     this.engine.removeEngineSchema(id);
   }
 
+  /**
+   * Normalized content of a registered schema entity, computed (and safety-checked)
+   * on first use and reused until the next pool mutation, mirroring the engine's
+   * compiled-schema cache. Nothing is cached when normalization throws.
+   */
+  private normalizedRegisteredSchema(entity: JsonEntity): any {
+    const cached = this.normalizedSchemaCache.get(entity.id);
+    if (cached !== undefined) return cached;
+    const normalized = this.normalizeSchema(entity.content);
+    this.normalizedSchemaCache.set(entity.id, normalized);
+    return normalized;
+  }
+
   private addEngineSchema(entity: JsonEntity): void {
+    this.normalizedSchemaCache.clear();
     const normalized = this.normalizeSchema(entity.content);
     if (!normalized.$id) normalized.$id = entity.id;
     this.engine.addEngineSchema(normalized, entity.id);
@@ -785,7 +801,7 @@ export class GtsStore {
       }
 
       const issues = this.validateWithEngine(
-        this.normalizeSchema(schemaEntity.content),
+        this.normalizedRegisteredSchema(schemaEntity),
         obj.content,
         obj.schemaId,
         undefined,
@@ -908,7 +924,7 @@ export class GtsStore {
       }
 
       const issues = this.validateWithEngine(
-        this.normalizeSchema(schemaEntity.content),
+        this.normalizedRegisteredSchema(schemaEntity),
         content,
         typeId,
         undefined,
@@ -2406,7 +2422,13 @@ export class GtsStore {
           id: schemaId,
           ok: false,
           error: `trait validation: ${details} — ${hint}`,
-          errors: traitIssues.map((issue) => ({ ...issue, instancePath: `/x-gts-traits${issue.instancePath}` })),
+          errors: traitIssues.map((issue) => ({
+            ...issue,
+            instancePath:
+              issue.instancePath === '/' || issue.instancePath === ''
+                ? '/x-gts-traits'
+                : `/x-gts-traits${issue.instancePath}`,
+          })),
         };
       }
     } catch (e) {

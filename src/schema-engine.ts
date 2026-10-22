@@ -7,10 +7,13 @@
  * GTS extensions applied to the draft-07 / 2019-09 / 2020-12 drafts:
  *  - `x-gts-ref` keyword (shared logic in `xGtsRefKeywordViolation`, `x-gts-ref.ts`);
  *  - `pattern` / `patternProperties` / `format: regex` through `compileSafePattern` (re2js);
- *  - GTS `date-time` / `time` / `regex` formats (ADR-0005) and the standard `uri`, `uri-reference`,
- *    `uri-template`, `hostname`, `ipv4`, `ipv6` formats the library lacks;
- *  - an `additionalProperties` validator without the library's `_id` blacklist.
- * Errors are mapped to the existing `ValidationIssue` shape.
+ *  - GTS `date-time` / `time` / `regex` formats (ADR-0005) and compatibility checkers for every other
+ *    format the former Ajv path asserted (ajv-formats `full` mode);
+ *  - own-property lookups for `properties` / `patternProperties` / `additionalProperties`, and an
+ *    `additionalProperties` validator without the library's `_id` blacklist;
+ *  - property names appended to instance pointers (and `properties` / `patternProperties` names appended to
+ *    schema locations) are RFC 6901 escaped where they are built, so paths are never ambiguous.
+ * Errors are mapped to the existing `ValidationIssue` shape (`schemaPath` = erroring node location + keyword).
  */
 
 import {
@@ -19,6 +22,7 @@ import {
   draft2019,
   draft2020,
   extendDraft,
+  isJsonError,
   isSchemaNode,
   type Draft,
   type JsonError,
@@ -27,15 +31,28 @@ import {
   type SchemaNode,
 } from 'json-schema-library';
 import {
+  isValidByte,
+  isValidDatePart,
   isValidDateTime,
+  isValidDuration,
+  isValidEmail,
   isValidHostname,
+  isValidInt32,
+  isValidInt64,
   isValidIpv4,
   isValidIpv6,
+  isValidIsoDateTime,
+  isValidIsoTime,
+  isValidJsonPointer,
+  isValidJsonPointerUriFragment,
   isValidRegex,
+  isValidRelativeJsonPointer,
   isValidTimePart,
   isValidUri,
   isValidUriReference,
   isValidUriTemplate,
+  isValidUrl,
+  isValidUuid,
 } from './gts-format-checkers';
 import { compileSafePattern, RegexCompilationError } from './regex-engine';
 import { dialectOf, type SchemaDialect } from './schema-dialect';
@@ -47,6 +64,8 @@ import { xGtsRefKeywordViolation } from './x-gts-ref';
 // ---------------------------------------------------------------------------
 
 type LibraryData = Record<string, any>;
+/** Error data key carrying the location of the schema node whose keyword produced the error. */
+const SCHEMA_LOCATION_KEY = 'schemaNodeLocation';
 type ParamExtractor = (data: LibraryData) => unknown;
 
 interface IssueCodeRow {
@@ -61,11 +80,14 @@ interface IssueCodeRow {
 /** Numeric-looking segments become numbers (array indexes are reported as numbers). */
 const indexOrString = (segment: string): string | number => (/^\d+$/.test(segment) ? Number(segment) : segment);
 
-/** Last path segment of a raw (unescaped) library pointer, unescaped. */
+const escapeSegment = (segment: string): string => segment.replace(/~/g, '~0').replace(/\//g, '~1');
+const unescapeSegment = (segment: string): string => segment.replace(/~1/g, '/').replace(/~0/g, '~');
+
+/** Last path segment of a library pointer (segments are escaped where built), unescaped. */
 function lastPointerSegment(data: LibraryData): string {
   const pointer = String(data.pointer ?? '');
   const index = pointer.lastIndexOf('/');
-  return index === -1 ? pointer.replace(/^#/, '') : pointer.slice(index + 1);
+  return unescapeSegment(index === -1 ? pointer.replace(/^#/, '') : pointer.slice(index + 1));
 }
 
 const from =
@@ -139,7 +161,14 @@ export const ISSUE_CODE_TABLE: Readonly<Record<string, IssueCodeRow>> = {
   'format-ipv6-leading-zero-error': fmt('ipv6'),
   'format-iri-error': fmt('iri'),
   'format-iri-reference-error': fmt('iri-reference'),
+  'format-iso-date-time-error': fmt('iso-date-time'),
+  'format-iso-time-error': fmt('iso-time'),
   'format-json-pointer-error': fmt('json-pointer'),
+  'format-json-pointer-uri-fragment-error': fmt('json-pointer-uri-fragment'),
+  'format-relative-json-pointer-error': fmt('relative-json-pointer'),
+  'format-byte-error': fmt('byte'),
+  'format-int32-error': fmt('int32'),
+  'format-int64-error': fmt('int64'),
   'format-regex-error': fmt('regex'),
   'format-time-error': fmt('time'),
   'format-uri-error': fmt('uri'),
@@ -202,59 +231,25 @@ export const ISSUE_CODE_TABLE: Readonly<Record<string, IssueCodeRow>> = {
   'x-gts-ref': row('x-gts-ref', 'pointer', { pattern: from('pattern') }),
 };
 
-const escapeSegment = (segment: string): string => segment.replace(/~/g, '~0').replace(/\//g, '~1');
+/** Keywords whose Ajv `schemaPath` is the node location itself (no keyword segment). */
+const LOCATION_ONLY_KEYWORDS = new Set(['schema', 'annotation']);
 
 /**
- * Split a raw library pointer (`/a/b/c`, segments unescaped) into its segments by
- * walking the instance, so keys containing `/` or `~` are not truncated.
- * Returns undefined when the pointer does not address existing data.
+ * JSON Pointer (RFC 6901, no `#`, root `/`) for a library pointer. Segments are already escaped where
+ * the validators build them; `parent` drops the offending child (always the last segment).
  */
-function resolveSegments(rest: string, node: unknown): string[] | undefined {
-  if (rest === '') return [];
-  if (typeof node !== 'object' || node === null) return undefined;
-  for (const key of Object.keys(node)) {
-    const prefix = `/${key}`;
-    if (rest === prefix || rest.startsWith(`${prefix}/`)) {
-      const tail = resolveSegments(rest.slice(prefix.length), (node as Record<string, unknown>)[key]);
-      if (tail !== undefined) return [key, ...tail];
-    }
-  }
-  return undefined;
-}
-
-/** JSON Pointer (RFC 6901, no `#`, root `/`) for a library pointer. */
-function toInstancePath(data: LibraryData, mode: 'pointer' | 'parent', instance: unknown): string {
+function toInstancePath(data: LibraryData, mode: 'pointer' | 'parent'): string {
   const raw = String(data.pointer ?? '#').replace(/^#/, '');
-  const child = data.property ?? data.key;
-  let segments = resolveSegments(raw, instance);
-  if (mode === 'parent') {
-    if (
-      segments !== undefined &&
-      segments.length > 0 &&
-      (child === undefined || segments[segments.length - 1] === `${child}`)
-    ) {
-      segments = segments.slice(0, -1);
-    } else {
-      // Not addressable in the instance: strip the exact child suffix, else the last segment.
-      const suffix = child === undefined ? undefined : `/${child}`;
-      const parentRaw =
-        suffix !== undefined && raw.endsWith(suffix)
-          ? raw.slice(0, -suffix.length)
-          : raw.slice(0, Math.max(raw.lastIndexOf('/'), 0));
-      segments = parentRaw === '' ? [] : parentRaw.slice(1).split('/');
-    }
-  } else if (segments === undefined) {
-    segments = raw === '' ? [] : raw.slice(1).split('/');
-  }
-  return segments.length === 0 ? '/' : `/${segments.map(escapeSegment).join('/')}`;
+  let segments = raw === '' ? [] : raw.slice(1).split('/');
+  if (mode === 'parent') segments = segments.slice(0, -1);
+  return segments.length === 0 ? '/' : `/${segments.join('/')}`;
 }
 
 /**
- * Map one library error to a {@link ValidationIssue}. `instance` is the
- * validated data (used to recover escaped pointer segments). Throws on a code
+ * Map one library error to a {@link ValidationIssue}. Throws on a code
  * missing from {@link ISSUE_CODE_TABLE}.
  */
-export function adaptLibraryError(error: JsonError, instance?: unknown): ValidationIssue {
+export function adaptLibraryError(error: JsonError): ValidationIssue {
   const code = String(error.code);
   const entry = ISSUE_CODE_TABLE[code];
   if (entry === undefined) throw new Error(`Unmapped json-schema-library error code: ${code}`);
@@ -265,10 +260,12 @@ export function adaptLibraryError(error: JsonError, instance?: unknown): Validat
     if (value !== undefined) params[name] = value;
   }
   const message = code === 'schema-error' && typeof data.message === 'string' ? data.message : error.message;
+  const keyword = typeof entry.keyword === 'function' ? entry.keyword(data) : entry.keyword;
+  const location = typeof data[SCHEMA_LOCATION_KEY] === 'string' ? (data[SCHEMA_LOCATION_KEY] as string) : '#';
   return {
-    instancePath: toInstancePath(data, entry.path, instance),
-    schemaPath: typeof data.schemaLocation === 'string' ? data.schemaLocation : '#',
-    keyword: typeof entry.keyword === 'function' ? entry.keyword(data) : entry.keyword,
+    instancePath: toInstancePath(data, entry.path),
+    schemaPath: LOCATION_ONLY_KEYWORDS.has(keyword) ? location : `${location}/${keyword}`,
+    keyword,
     message,
     params,
   };
@@ -328,6 +325,26 @@ function createPatternKeyword(base: Keyword): Keyword {
   };
 }
 
+type ValidationResult = ReturnType<NonNullable<Keyword['validate']>>;
+
+/**
+ * Run a child node's validation and tag its so far untagged errors (a `false` subschema reports from
+ * `validateNode`, outside any keyword) with the child's own location.
+ */
+function validateChild(child: SchemaNode, value: unknown, pointer: string, path: JsonSchemaValidatorParams['path']) {
+  const { errors } = child.validate(value, pointer, path);
+  for (const error of errors) {
+    if (isJsonError(error) && error.data[SCHEMA_LOCATION_KEY] === undefined) {
+      error.data[SCHEMA_LOCATION_KEY] = child.schemaLocation;
+    }
+  }
+  return errors;
+}
+
+const hasOwn = (target: object, key: string): boolean => Object.prototype.hasOwnProperty.call(target, key);
+const isPlainObject = (data: unknown): data is Record<string, unknown> =>
+  typeof data === 'object' && data !== null && !Array.isArray(data);
+
 function createPatternPropertiesKeyword(base: Keyword): Keyword {
   return {
     ...base,
@@ -345,7 +362,7 @@ function createPatternPropertiesKeyword(base: Keyword): Keyword {
             node: node.compileSchema(
               schema.patternProperties[name],
               `${node.evaluationPath}/patternProperties/${name}`,
-              `${node.schemaLocation}/patternProperties/${name}`
+              `${node.schemaLocation}/patternProperties/${escapeSegment(name)}`
             ),
           });
         } catch (error) {
@@ -355,35 +372,54 @@ function createPatternPropertiesKeyword(base: Keyword): Keyword {
       node.patternProperties = compiled;
       return compiled.flatMap(({ node: child }) => child.schemaValidation ?? []);
     },
+    // Only validates the values of pattern-matched properties. The library also reports unmatched
+    // properties here (with a prototype-chain `properties[key]` lookup that let `constructor`,
+    // `toString` or `__proto__` through a closed schema); that part is `additionalProperties`' job below.
+    validate: ({ node, data, pointer = '#', path }: JsonSchemaValidatorParams) => {
+      if (!isPlainObject(data)) return undefined;
+      const errors: ValidationResult = [];
+      for (const property of Object.keys(data)) {
+        const value = data[property];
+        if (value === undefined) continue;
+        for (const { pattern, node: child } of node.patternProperties ?? []) {
+          if (!pattern.test(property)) continue;
+          (errors as unknown[]).push(...validateChild(child, value, `${pointer}/${escapeSegment(property)}`, path));
+        }
+      }
+      return errors;
+    },
   };
 }
 
 /**
  * `additionalProperties` validation without the library's `_id` property
  * blacklist (`settings.propertyBlacklist`, which lets `_id` bypass a closed
- * schema). Library-global settings are left untouched.
+ * schema). Library-global settings are left untouched. It also owns the closed-schema
+ * check next to `patternProperties` (the library delegates it to its own
+ * `patternProperties` validator, see {@link createPatternPropertiesKeyword}).
  */
 function createAdditionalPropertiesKeyword(base: Keyword): Keyword {
   return {
     ...base,
+    addValidate: ({ schema }) => schema.additionalProperties !== true && schema.additionalProperties != null,
     validate: ({ node, data, pointer = '#', path }: JsonSchemaValidatorParams) => {
-      if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined;
-      const record = data as Record<string, unknown>;
+      if (!isPlainObject(data)) return undefined;
       const patterns = node.patternProperties;
-      const expected = node.properties ? Object.keys(node.properties) : [];
-      const errors: ReturnType<NonNullable<Keyword['validate']>> = [];
-      for (const property of Object.keys(record)) {
+      const properties = node.properties ?? {};
+      const expected = Object.keys(properties);
+      const errors: ValidationResult = [];
+      for (const property of Object.keys(data)) {
         if (patterns?.some(({ pattern }) => pattern.test(property))) continue;
-        if (expected.includes(property)) continue;
-        const value = record[property];
+        if (hasOwn(properties, property)) continue;
+        const value = data[property];
         if (value === undefined) continue;
+        const propertyPointer = `${pointer}/${escapeSegment(property)}`;
         if (node.additionalProperties) {
-          const result = node.additionalProperties.validate(value, `${pointer}/${property}`, path);
-          (errors as unknown[]).push(...result.errors);
+          (errors as unknown[]).push(...validateChild(node.additionalProperties, value, propertyPointer, path));
         } else {
           (errors as unknown[]).push(
             node.createError('no-additional-properties-error', {
-              pointer: `${pointer}/${property}`,
+              pointer: propertyPointer,
               schema: node.schema,
               value: data,
               property,
@@ -400,28 +436,108 @@ function createAdditionalPropertiesKeyword(base: Keyword): Keyword {
 /**
  * `properties` with own-property lookup: the library indexes `node.properties[name]`, so an
  * instance property named `__proto__` (or `constructor`) would resolve to `Object.prototype`.
+ * The parsed map has no prototype (this also protects the library's other `node.properties?.[name]`
+ * lookups, for example in `unevaluatedProperties`) and child schema locations are pointer-escaped.
  */
 function createPropertiesKeyword(base: Keyword): Keyword {
   return {
     ...base,
+    parse: (node: SchemaNode) => {
+      const { schema, evaluationPath, schemaLocation } = node;
+      if (schema.properties == null) return undefined;
+      if (!isPlainObject(schema.properties)) {
+        return node.createError('schema-error', {
+          pointer: schemaLocation,
+          schema,
+          value: undefined,
+          message: 'keyword `properties` must be of type `object`',
+        });
+      }
+      const errors: NonNullable<SchemaNode['schemaValidation']> = [];
+      const parsed: Record<string, SchemaNode> = Object.create(null);
+      for (const name of Object.keys(schema.properties)) {
+        const child = node.compileSchema(
+          schema.properties[name] as Record<string, any>,
+          `${evaluationPath}/properties/${name}`,
+          `${schemaLocation}/properties/${escapeSegment(name)}`
+        );
+        parsed[name] = child;
+        errors.push(...(child.schemaValidation ?? []));
+      }
+      node.properties = parsed;
+      return errors;
+    },
     validate: ({ node, data, pointer = '#', path }: JsonSchemaValidatorParams) => {
-      if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined;
-      const record = data as Record<string, unknown>;
+      if (!isPlainObject(data)) return undefined;
       const properties = node.properties ?? {};
-      const errors: ReturnType<NonNullable<Keyword['validate']>> = [];
-      for (const property of Object.keys(record)) {
-        if (!Object.prototype.hasOwnProperty.call(properties, property)) continue;
-        const value = record[property];
+      const errors: ValidationResult = [];
+      for (const property of Object.keys(data)) {
+        if (!hasOwn(properties, property)) continue;
+        const value = data[property];
         if (value === undefined) continue;
-        const result = properties[property].validate(value, `${pointer}/${property}`, path);
-        (errors as unknown[]).push(...result.errors);
+        const propertyPointer = `${pointer}/${escapeSegment(property)}`;
+        (errors as unknown[]).push(...validateChild(properties[property], value, propertyPointer, path));
       }
       return errors;
     },
   };
 }
 
-type FormatFn = (params: JsonSchemaValidatorParams) => ReturnType<NonNullable<Keyword['validate']>>;
+/**
+ * `unevaluatedProperties` builds `${pointer}/${name}` itself; escape the first segment after the
+ * incoming pointer afterwards. Residual: when two unevaluated sibling keys exist where one is the other
+ * followed by `/...` (for example `a` and `a/b`), a nested error below the shorter key can be attributed
+ * to the first matching key, since the library hands back only the joined string.
+ */
+function createUnevaluatedPropertiesKeyword(base: Keyword): Keyword {
+  const baseValidate = base.validate;
+  return {
+    ...base,
+    validate: (params: JsonSchemaValidatorParams) => {
+      const result = baseValidate?.(params);
+      const { data, pointer = '#' } = params;
+      if (!isPlainObject(data) || !Array.isArray(result)) return result;
+      const prefix = `${pointer}/`;
+      const keys = Object.keys(data);
+      for (const error of result) {
+        if (!isJsonError(error)) continue;
+        const errorPointer = error.data.pointer;
+        if (typeof errorPointer !== 'string' || !errorPointer.startsWith(prefix)) continue;
+        const rest = errorPointer.slice(prefix.length);
+        const key = keys.find((candidate) => rest === candidate) ?? keys.find((c) => rest.startsWith(`${c}/`));
+        if (key === undefined) continue;
+        error.data.pointer = `${prefix}${escapeSegment(key)}${rest.slice(key.length)}`;
+      }
+      return result;
+    },
+  };
+}
+
+/**
+ * Tag every error with the location of the schema node whose keyword produced it (the innermost
+ * wrapper runs first, so an error keeps its own node), for the adapter's Ajv-shaped `schemaPath`.
+ */
+function withSchemaLocation(keyword: Keyword): Keyword {
+  const { validate } = keyword;
+  if (validate === undefined) return keyword;
+  return {
+    ...keyword,
+    validate: (params: JsonSchemaValidatorParams) => {
+      const result = validate(params);
+      for (const entry of Array.isArray(result) ? result : [result]) {
+        if (isJsonError(entry) && entry.data[SCHEMA_LOCATION_KEY] === undefined) {
+          // A `false` subschema reported by this keyword itself (for example `items: false`) is `<keyword>/false schema`.
+          const location = params.node.schemaLocation;
+          entry.data[SCHEMA_LOCATION_KEY] =
+            entry.code === 'invalid-data-error' ? `${location}/${keyword.keyword}` : location;
+        }
+      }
+      return result;
+    },
+  };
+}
+
+type FormatFn = (params: JsonSchemaValidatorParams) => ValidationResult;
 
 function gtsFormat(code: string, isValid: (value: string) => boolean): FormatFn {
   return ({ node, data, pointer = '#' }) => {
@@ -430,28 +546,73 @@ function gtsFormat(code: string, isValid: (value: string) => boolean): FormatFn 
   };
 }
 
+/** A format that applies to numbers (ajv-formats `type: number` formats); other instance types are ignored. */
+function gtsNumberFormat(code: string, isValid: (value: number) => boolean): FormatFn {
+  return ({ node, data, pointer = '#' }) => {
+    if (typeof data !== 'number' || isValid(data)) return undefined;
+    return node.createError(code, { value: data, pointer, schema: node.schema });
+  };
+}
+
+/** A format that is registered but never asserts (ajv-formats `password`, `binary`, `float`, `double`). */
+const annotationFormat: FormatFn = () => undefined;
+
 function buildDraft(base: Draft, getSelectedTypeId: () => string | undefined): Draft {
-  return extendDraft(base, {
+  const extended = extendDraft(base, {
     keywords: [
       createXGtsRefKeyword(getSelectedTypeId),
       createPatternKeyword(findKeyword(base, 'pattern')),
       createPatternPropertiesKeyword(findKeyword(base, 'patternProperties')),
       createAdditionalPropertiesKeyword(findKeyword(base, 'additionalProperties')),
       createPropertiesKeyword(findKeyword(base, 'properties')),
+      // draft-07 has no `unevaluatedProperties`
+      ...(base.keywords.some(({ keyword }) => keyword === 'unevaluatedProperties')
+        ? [createUnevaluatedPropertiesKeyword(findKeyword(base, 'unevaluatedProperties'))]
+        : []),
     ],
-    errors: { 'x-gts-ref': 'Value does not match x-gts-ref pattern' },
+    errors: {
+      'x-gts-ref': 'Value does not match x-gts-ref pattern',
+      'format-iso-time-error': 'Value `{{value}}` at `{{pointer}}` is not a valid iso-time',
+      'format-iso-date-time-error': 'Value `{{value}}` at `{{pointer}}` is not a valid iso-date-time',
+      'format-json-pointer-uri-fragment-error':
+        'Value `{{value}}` at `{{pointer}}` is not a valid json-pointer-uri-fragment',
+      'format-relative-json-pointer-error': 'Value `{{value}}` at `{{pointer}}` is not a valid relative-json-pointer',
+      'format-byte-error': 'Value `{{value}}` at `{{pointer}}` is not a valid byte (base64)',
+      'format-int32-error': 'Value `{{value}}` at `{{pointer}}` is not a valid int32',
+      'format-int64-error': 'Value `{{value}}` at `{{pointer}}` is not a valid int64',
+    },
+    // Every format ajv-formats 3.0.1 `full` mode asserted, plus the GTS date-time / time / regex of ADR-0005.
     formats: {
+      date: gtsFormat('format-date-error', isValidDatePart),
       'date-time': gtsFormat('format-date-time-error', isValidDateTime),
       time: gtsFormat('format-time-error', isValidTimePart),
+      'iso-time': gtsFormat('format-iso-time-error', isValidIsoTime),
+      'iso-date-time': gtsFormat('format-iso-date-time-error', isValidIsoDateTime),
+      duration: gtsFormat('format-duration-error', isValidDuration),
       regex: gtsFormat('format-regex-error', isValidRegex),
       uri: gtsFormat('format-uri-error', isValidUri),
       'uri-reference': gtsFormat('format-uri-reference-error', isValidUriReference),
       'uri-template': gtsFormat('format-uri-template-error', isValidUriTemplate),
+      url: gtsFormat('format-url-error', isValidUrl),
+      email: gtsFormat('format-email-error', isValidEmail),
       hostname: gtsFormat('format-hostname-error', isValidHostname),
       ipv4: gtsFormat('format-ipv4-error', isValidIpv4),
       ipv6: gtsFormat('format-ipv6-error', isValidIpv6),
+      uuid: gtsFormat('format-uuid-error', isValidUuid),
+      'json-pointer': gtsFormat('format-json-pointer-error', isValidJsonPointer),
+      'json-pointer-uri-fragment': gtsFormat('format-json-pointer-uri-fragment-error', isValidJsonPointerUriFragment),
+      'relative-json-pointer': gtsFormat('format-relative-json-pointer-error', isValidRelativeJsonPointer),
+      byte: gtsFormat('format-byte-error', isValidByte),
+      int32: gtsNumberFormat('format-int32-error', isValidInt32),
+      int64: gtsNumberFormat('format-int64-error', isValidInt64),
+      float: annotationFormat,
+      double: annotationFormat,
+      password: annotationFormat,
+      binary: annotationFormat,
     },
   });
+  // Re-extend with the location-tagging wrappers (also re-sanitizes the keyword validators).
+  return extendDraft(extended, { keywords: extended.keywords.map(withSchemaLocation) });
 }
 
 // ---------------------------------------------------------------------------
@@ -537,15 +698,15 @@ export function createSchemaEngine(options: SchemaEngineOptions): SchemaEngine {
     const dialect = dialectOf(schema);
     const draft = drafts[dialect];
     const host = hostFor(dialect, schema);
-    const hostErrorCount = host.schemaErrors?.length ?? 0;
+    const hostErrors = new Set<JsonError>(host.schemaErrors ?? []);
     const root = compileSchema(clone(schema), {
       drafts: [draft],
       remote: host,
       throwOnInvalidRef: true,
       throwOnInvalidSchema: false,
     });
-    const all = root.schemaErrors ?? [];
-    return { root, ownErrors: hostErrorCount > 0 ? all.slice(0, all.length - hostErrorCount) : all };
+    // The root's `schemaErrors` also carry the remote host's own errors (the same objects): drop them by identity.
+    return { root, ownErrors: (root.schemaErrors ?? []).filter((error) => !hostErrors.has(error)) };
   }
 
   /**
@@ -606,7 +767,7 @@ export function createSchemaEngine(options: SchemaEngineOptions): SchemaEngine {
       if (ownErrors.length > 0) throw new Error(ownErrors.map((error) => error.message).join('; '));
       assertRefsResolve(root);
       const compiled: CompiledSchema = {
-        validate: (data) => root.validate(data).errors.map((error) => adaptLibraryError(error, data)),
+        validate: (data) => root.validate(data).errors.map((error) => adaptLibraryError(error)),
       };
       if (key !== undefined) cache.set(key, compiled);
       return compiled;

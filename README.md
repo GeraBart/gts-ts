@@ -1,5 +1,27 @@
 # GTS TypeScript Implementation
 
+<!-- toc -->
+
+- [Overview](#overview)
+  - [Regular expressions](#regular-expressions)
+- [Roadmap](#roadmap)
+- [Usage](#usage)
+  - [Basic Operations](#basic-operations)
+  - [Using the GTS Store](#using-the-gts-store)
+  - [Source-aware diagnostics](#source-aware-diagnostics)
+  - [Advanced Query Language](#advanced-query-language)
+- [Content Security Policy](#content-security-policy)
+- [CLI Usage](#cli-usage)
+- [Web Server](#web-server)
+  - [Building the Server](#building-the-server)
+  - [Starting the Server](#starting-the-server)
+  - [API Endpoints](#api-endpoints)
+  - [Example Usage](#example-usage)
+- [Development](#development)
+- [License](#license)
+
+<!-- /toc -->
+
 A complete TypeScript implementation of the Global Type System (GTS)
 
 ## Overview

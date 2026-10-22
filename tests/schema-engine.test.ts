@@ -40,7 +40,7 @@ describe('issue adapter: params and instancePath', () => {
     expect(issues[0].keyword).toBe('type');
     expect(issues[0].params).toEqual({ type: 'string' });
     expect(issues[0].instancePath).toBe('/');
-    expect(issues[0].schemaPath).toBeDefined();
+    expect(issues[0].schemaPath).toBe('#/type');
     expect(`is not of type '${issues[0].params.type}'`).toBe("is not of type 'string'");
   });
 
@@ -473,6 +473,9 @@ interface Probe {
   schema: Record<string, unknown>;
   data: unknown;
   instancePath?: string;
+  /** Expected `schemaPath` (as Ajv 8 reports it); `schemaPaths` when it differs per dialect. */
+  schemaPath?: string;
+  schemaPaths?: Partial<Record<keyof typeof DIALECTS, string>>;
   omitParams?: string[];
 }
 const probes: Probe[] = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'adapter-probes.json'), 'utf8'));
@@ -538,13 +541,13 @@ describe('issue adapter probes: every code against real library error data', () 
     const { raw } = run(probe, dialect);
     expect(raw).toBeDefined();
     const row = ISSUE_CODE_TABLE[probe.code];
-    const issue = adaptLibraryError(raw!, probe.data);
+    const issue = adaptLibraryError(raw!);
     const expectedKeys = Object.keys(row.params).filter((key) => !(probe.omitParams ?? []).includes(key));
     expect(Object.keys(issue.params).sort()).toEqual(expectedKeys.sort());
     expect(issue.instancePath).toBe(probe.instancePath ?? '/');
     expect(issue.instancePath.startsWith('#')).toBe(false);
     expect(typeof issue.keyword).toBe('string');
-    expect(issue.schemaPath).toBeDefined();
+    expect(issue.schemaPath).toBe(probe.schemaPaths?.[dialect] ?? probe.schemaPath);
   });
 
   test('schema-error (validateSchemaDocument) maps to keyword schema with the library message and a pointer path', () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Performance gate for GtsStore.validateInstance (cached and first-call paths) plus a heap-growth mode.
-// Usage: node scripts/bench.mjs [--root <dir>] [--measure] [--thresholds <file>] [--heap]
+// Usage: node scripts/bench.mjs [--root <dir>] [--measure] [--thresholds <file>] [--heap] [--runs <n>]
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -20,17 +20,29 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const defaultRoot = path.resolve(here, '..');
 
 function usage(msg) {
-  process.stderr.write(`${msg}\nusage: node scripts/bench.mjs [--root <dir>] [--measure] [--thresholds <file>] [--heap]\n`);
+  process.stderr.write(
+    `${msg}\nusage: node scripts/bench.mjs [--root <dir>] [--measure] [--thresholds <file>] [--heap] [--runs <n>]\n`
+  );
   process.exit(2);
 }
 
 function parseArgs(argv) {
-  const opts = { root: defaultRoot, measure: false, thresholds: path.join(defaultRoot, 'bench', 'thresholds.json'), heap: false };
+  const opts = {
+    root: defaultRoot,
+    measure: false,
+    thresholds: path.join(defaultRoot, 'bench', 'thresholds.json'),
+    heap: false,
+    runs: 1,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--measure') opts.measure = true;
     else if (a === '--heap') opts.heap = true;
-    else if (a === '--root' || a === '--thresholds') {
+    else if (a === '--runs') {
+      const v = argv[++i];
+      if (!v || !/^\d+$/.test(v) || Number(v) < 1) usage('--runs needs an integer >= 1');
+      opts.runs = Number(v);
+    } else if (a === '--root' || a === '--thresholds') {
       const v = argv[++i];
       if (!v) usage(`${a} needs a value`);
       if (a === '--root') opts.root = path.resolve(v);
@@ -48,7 +60,12 @@ function buildWorkload() {
         ? { type: 'string', maxLength: 50 }
         : i % 3 === 1
           ? { type: 'integer' }
-          : { oneOf: [{ type: 'string' }, { type: 'object', properties: { x: { oneOf: [{ type: 'number' }, { type: 'null' }] } } }] };
+          : {
+              oneOf: [
+                { type: 'string' },
+                { type: 'object', properties: { x: { oneOf: [{ type: 'number' }, { type: 'null' }] } } },
+              ],
+            };
   }
   props.id = { type: 'string' };
   const schema = { $id: 'gts://' + TYPE_ID, $schema: DIALECT, type: 'object', properties: props };
@@ -109,38 +126,59 @@ function main() {
     const validateInstanceGrowthMb = workload(() => checked(store.validateInstance(INSTANCE_ID)));
     const transientStore = makeStore();
     checked(transientStore.validateTransientInstance(instance, TYPE_ID, null));
-    const validateTransientGrowthMb = workload(() => checked(transientStore.validateTransientInstance(instance, TYPE_ID, null)));
-    console.log(JSON.stringify({ ...env, calls: HEAP_CALLS, heap_growth_mb: { validateInstance: validateInstanceGrowthMb, validateTransientInstance: validateTransientGrowthMb } }));
+    const validateTransientGrowthMb = workload(() =>
+      checked(transientStore.validateTransientInstance(instance, TYPE_ID, null))
+    );
+    console.log(
+      JSON.stringify({
+        ...env,
+        calls: HEAP_CALLS,
+        heap_growth_mb: {
+          validateInstance: validateInstanceGrowthMb,
+          validateTransientInstance: validateTransientGrowthMb,
+        },
+      })
+    );
     return;
   }
 
-  // cached path
-  const store = makeStore();
-  for (let i = 0; i < WARMUP; i++) checked(store.validateInstance(INSTANCE_ID));
-  const cached = [];
-  for (let i = 0; i < CACHED_ITERATIONS; i++) {
-    const a = nowUs();
-    const r = store.validateInstance(INSTANCE_ID);
-    const b = nowUs();
-    checked(r);
-    cached.push(b - a);
-  }
-  // first-call path: fresh store per measurement, setup untimed
-  const first = [];
-  for (let i = 0; i < FIRST_CALL_WARMUP + FIRST_CALL_ITERATIONS; i++) {
-    const s = makeStore();
-    const a = nowUs();
-    const r = s.validateInstance(INSTANCE_ID);
-    const b = nowUs();
-    checked(r);
-    if (i >= FIRST_CALL_WARMUP) first.push(b - a);
+  const measureOnce = () => {
+    // cached path
+    const store = makeStore();
+    for (let i = 0; i < WARMUP; i++) checked(store.validateInstance(INSTANCE_ID));
+    const cached = [];
+    for (let i = 0; i < CACHED_ITERATIONS; i++) {
+      const a = nowUs();
+      const r = store.validateInstance(INSTANCE_ID);
+      const b = nowUs();
+      checked(r);
+      cached.push(b - a);
+    }
+    // first-call path: fresh store per measurement, setup untimed
+    const first = [];
+    for (let i = 0; i < FIRST_CALL_WARMUP + FIRST_CALL_ITERATIONS; i++) {
+      const s = makeStore();
+      const a = nowUs();
+      const r = s.validateInstance(INSTANCE_ID);
+      const b = nowUs();
+      checked(r);
+      if (i >= FIRST_CALL_WARMUP) first.push(b - a);
+    }
+    return { cached_validate: Number(median(cached).toFixed(2)), first_call: Number(median(first).toFixed(2)) };
+  };
+  const perRun = { cached_validate: [], first_call: [] };
+  for (let n = 0; n < opts.runs; n++) {
+    const m = measureOnce();
+    perRun.cached_validate.push(m.cached_validate);
+    perRun.first_call.push(m.first_call);
   }
   const result = {
     ...env,
-    runs: 1,
+    runs: opts.runs,
     iterations: { cached_validate: CACHED_ITERATIONS, first_call: FIRST_CALL_ITERATIONS },
     warmup: { cached_validate: WARMUP, first_call: FIRST_CALL_WARMUP },
-    median_us: { cached_validate: Number(median(cached).toFixed(2)), first_call: Number(median(first).toFixed(2)) },
+    per_run_median_us: perRun,
+    median_us: { cached_validate: median(perRun.cached_validate), first_call: median(perRun.first_call) },
   };
   console.log(JSON.stringify(result));
   if (opts.measure) return;

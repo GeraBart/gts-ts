@@ -1,7 +1,8 @@
 /**
  * Engine-independent GTS format checkers (ADR-0005/0006): `date-time` and `time` with
- * mandatory timezone offsets, and `regex` checking the GTS regex profile.
- * Used by the schema engine.
+ * mandatory timezone offsets, and `regex` checking the GTS regex profile, plus the other
+ * formats the former Ajv path asserted through ajv-formats 3.0.1 `full` mode (MIT), kept
+ * with the same patterns and semantics. Used by the schema engine.
  */
 
 import { regexProfileViolation } from './regex-profile';
@@ -14,7 +15,7 @@ function isLeapYear(year: number): boolean {
 }
 
 /** RFC 3339 full-date validity - same rule ajv-formats uses for `format: date`. */
-function isValidDatePart(value: string): boolean {
+export function isValidDatePart(value: string): boolean {
   const match = DATE_RE.exec(value);
   if (!match) return false;
   const year = Number(match[1]);
@@ -128,4 +129,94 @@ export function isValidIpv4(value: string): boolean {
 /** RFC 4291 IPv6 address (`format: ipv6`). */
 export function isValidIpv6(value: string): boolean {
   return IPV6_RE.test(value);
+}
+
+// Remaining ajv-formats 3.0.1 `full`-mode formats (MIT), so assertions keep the behavior of the former Ajv path.
+const ISO_TIME_RE = /^(\d\d):(\d\d):(\d\d(?:\.\d+)?)(z|([+-])(\d\d)(?::?(\d\d))?)?$/i;
+const ISO_DATE_TIME_SEPARATOR = /t|\s/i;
+const DURATION_RE = /^P(?!$)((\d+Y)?(\d+M)?(\d+D)?(T(?=\d)(\d+H)?(\d+M)?(\d+S)?)?|(\d+W)?)$/;
+const URL_RE =
+  /^(?:https?|ftp):\/\/(?:\S+(?::\S*)?@)?(?:(?!(?:10|127)(?:\.\d{1,3}){3})(?!(?:169\.254|192\.168)(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z0-9\u{00a1}-\u{ffff}]+-)*[a-z0-9\u{00a1}-\u{ffff}]+)(?:\.(?:[a-z0-9\u{00a1}-\u{ffff}]+-)*[a-z0-9\u{00a1}-\u{ffff}]+)*(?:\.(?:[a-z\u{00a1}-\u{ffff}]{2,})))(?::\d{2,5})?(?:\/[^\s]*)?$/iu;
+const EMAIL_RE =
+  /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i;
+const UUID_RE = /^(?:urn:uuid:)?[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+const JSON_POINTER_RE = /^(?:\/(?:[^~/]|~0|~1)*)*$/;
+const JSON_POINTER_URI_FRAGMENT_RE = /^#(?:\/(?:[a-z0-9_\-.!$&'()*+,;:=@]|%[0-9a-f]{2}|~0|~1)*)*$/i;
+const RELATIVE_JSON_POINTER_RE = /^(?:0|[1-9][0-9]*)(?:#|(?:\/(?:[^~/]|~0|~1)*)*)$/;
+// ajv-formats keeps the `m` flag here, so any line of a multi-line string may match; reproduced for parity.
+const BYTE_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/m;
+const MIN_INT32 = -(2 ** 31);
+const MAX_INT32 = 2 ** 31 - 1;
+
+/** RFC 3339 time with an optional offset; leap seconds are checked against the UTC-adjusted time. */
+export function isValidIsoTime(value: string): boolean {
+  const match = ISO_TIME_RE.exec(value);
+  if (!match) return false;
+  const hour = +match[1];
+  const minute = +match[2];
+  const second = +match[3];
+  const sign = match[5] === '-' ? -1 : 1;
+  const offsetHour = +(match[6] || 0);
+  const offsetMinute = +(match[7] || 0);
+  if (offsetHour > 23 || offsetMinute > 59) return false;
+  if (hour <= 23 && minute <= 59 && second < 60) return true;
+  const utcMinute = minute - offsetMinute * sign;
+  const utcHour = hour - offsetHour * sign - (utcMinute < 0 ? 1 : 0);
+  return (utcHour === 23 || utcHour === -1) && (utcMinute === 59 || utcMinute === -1) && second < 61;
+}
+
+/** RFC 3339 date-time with an optional offset and a `T`, `t` or whitespace separator (`format: iso-date-time`). */
+export function isValidIsoDateTime(value: string): boolean {
+  const parts = value.split(ISO_DATE_TIME_SEPARATOR);
+  return parts.length === 2 && isValidDatePart(parts[0]) && isValidIsoTime(parts[1]);
+}
+
+/** RFC 3339 Appendix A duration (`format: duration`). */
+export function isValidDuration(value: string): boolean {
+  return DURATION_RE.test(value);
+}
+
+/** Absolute http, https or ftp URL (`format: url`). */
+export function isValidUrl(value: string): boolean {
+  return URL_RE.test(value);
+}
+
+/** Email address (`format: email`). */
+export function isValidEmail(value: string): boolean {
+  return EMAIL_RE.test(value);
+}
+
+/** RFC 4122 UUID, optionally `urn:uuid:` prefixed (`format: uuid`). */
+export function isValidUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/** RFC 6901 JSON pointer (`format: json-pointer`). */
+export function isValidJsonPointer(value: string): boolean {
+  return JSON_POINTER_RE.test(value);
+}
+
+/** RFC 6901 JSON pointer in URI fragment form (`format: json-pointer-uri-fragment`). */
+export function isValidJsonPointerUriFragment(value: string): boolean {
+  return JSON_POINTER_URI_FRAGMENT_RE.test(value);
+}
+
+/** Relative JSON pointer (`format: relative-json-pointer`). */
+export function isValidRelativeJsonPointer(value: string): boolean {
+  return RELATIVE_JSON_POINTER_RE.test(value);
+}
+
+/** Base64 string (`format: byte`). */
+export function isValidByte(value: string): boolean {
+  return BYTE_RE.test(value);
+}
+
+/** Signed 32-bit integer (`format: int32`, applies to numbers). */
+export function isValidInt32(value: number): boolean {
+  return Number.isInteger(value) && value <= MAX_INT32 && value >= MIN_INT32;
+}
+
+/** Signed 64-bit integer (`format: int64`, applies to numbers; any JS safe integer fits). */
+export function isValidInt64(value: number): boolean {
+  return Number.isInteger(value);
 }

@@ -10,7 +10,8 @@
       ],
       "additionalItems": false
     },
-    "data": ["a", 1]
+    "data": ["a", 1],
+    "schemaPath": "#/additionalItems"
   },
   {
     "code": "type-error",
@@ -22,7 +23,8 @@
       ]
     },
     "data": 5,
-    "label": "inside allOf (the library reports the inner error, as Ajv does)"
+    "label": "inside allOf (the library reports the inner error, as Ajv does)",
+    "schemaPath": "#/allOf/0/type"
   },
   {
     "code": "any-of-error",
@@ -36,14 +38,16 @@
         }
       ]
     },
-    "data": true
+    "data": true,
+    "schemaPath": "#/anyOf"
   },
   {
     "code": "const-error",
     "schema": {
       "const": 1
     },
-    "data": 2
+    "data": 2,
+    "schemaPath": "#/const"
   },
   {
     "code": "contains-max-error",
@@ -54,7 +58,8 @@
       },
       "maxContains": 1
     },
-    "data": ["a", "b"]
+    "data": ["a", "b"],
+    "schemaPath": "#/contains"
   },
   {
     "code": "contains-min-error",
@@ -66,28 +71,32 @@
       "minContains": 2
     },
     "data": ["a"],
-    "omitParams": ["maxContains"]
+    "omitParams": ["maxContains"],
+    "schemaPath": "#/contains"
   },
   {
     "code": "enum-error",
     "schema": {
       "enum": ["a", "b"]
     },
-    "data": "c"
+    "data": "c",
+    "schemaPath": "#/enum"
   },
   {
     "code": "exclusive-maximum-error",
     "schema": {
       "exclusiveMaximum": 5
     },
-    "data": 5
+    "data": 5,
+    "schemaPath": "#/exclusiveMaximum"
   },
   {
     "code": "exclusive-minimum-error",
     "schema": {
       "exclusiveMinimum": 5
     },
-    "data": 5
+    "data": 5,
+    "schemaPath": "#/exclusiveMinimum"
   },
   {
     "code": "format-date-error",
@@ -95,7 +104,8 @@
     "schema": {
       "format": "date"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-date-time-error",
@@ -103,7 +113,8 @@
     "schema": {
       "format": "date-time"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-duration-error",
@@ -111,7 +122,8 @@
     "schema": {
       "format": "duration"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-email-error",
@@ -119,7 +131,8 @@
     "schema": {
       "format": "email"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-hostname-error",
@@ -127,7 +140,8 @@
     "schema": {
       "format": "hostname"
     },
-    "data": "-bad-"
+    "data": "-bad-",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-ipv4-error",
@@ -135,7 +149,8 @@
     "schema": {
       "format": "ipv4"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-ipv6-error",
@@ -143,7 +158,8 @@
     "schema": {
       "format": "ipv6"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-json-pointer-error",
@@ -151,7 +167,8 @@
     "schema": {
       "format": "json-pointer"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-regex-error",
@@ -159,7 +176,8 @@
     "schema": {
       "format": "regex"
     },
-    "data": "("
+    "data": "(",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-time-error",
@@ -167,7 +185,8 @@
     "schema": {
       "format": "time"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-uri-error",
@@ -175,7 +194,8 @@
     "schema": {
       "format": "uri"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-uri-reference-error",
@@ -183,7 +203,8 @@
     "schema": {
       "format": "uri-reference"
     },
-    "data": "http://[bad"
+    "data": "http://[bad",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-uri-template-error",
@@ -191,7 +212,8 @@
     "schema": {
       "format": "uri-template"
     },
-    "data": "{bad"
+    "data": "{bad",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-url-error",
@@ -199,7 +221,8 @@
     "schema": {
       "format": "url"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "format-uuid-error",
@@ -207,7 +230,8 @@
     "schema": {
       "format": "uuid"
     },
-    "data": "nope"
+    "data": "nope",
+    "schemaPath": "#/format"
   },
   {
     "code": "invalid-data-error",
@@ -216,7 +240,8 @@
       "type": "array",
       "items": false
     },
-    "data": [1]
+    "data": [1],
+    "schemaPath": "#/items/false schema"
   },
   {
     "code": "invalid-property-name-error",
@@ -227,21 +252,24 @@
     },
     "data": {
       "b": 1
-    }
+    },
+    "schemaPath": "#/propertyNames"
   },
   {
     "code": "max-items-error",
     "schema": {
       "maxItems": 1
     },
-    "data": [1, 2]
+    "data": [1, 2],
+    "schemaPath": "#/maxItems"
   },
   {
     "code": "max-length-error",
     "schema": {
       "maxLength": 1
     },
-    "data": "ab"
+    "data": "ab",
+    "schemaPath": "#/maxLength"
   },
   {
     "code": "max-properties-error",
@@ -251,28 +279,32 @@
     "data": {
       "a": 1,
       "b": 2
-    }
+    },
+    "schemaPath": "#/maxProperties"
   },
   {
     "code": "maximum-error",
     "schema": {
       "maximum": 5
     },
-    "data": 6
+    "data": 6,
+    "schemaPath": "#/maximum"
   },
   {
     "code": "min-items-error",
     "schema": {
       "minItems": 2
     },
-    "data": [1]
+    "data": [1],
+    "schemaPath": "#/minItems"
   },
   {
     "code": "min-length-error",
     "schema": {
       "minLength": 2
     },
-    "data": "a"
+    "data": "a",
+    "schemaPath": "#/minLength"
   },
   {
     "code": "min-properties-error",
@@ -281,14 +313,16 @@
     },
     "data": {
       "a": 1
-    }
+    },
+    "schemaPath": "#/minProperties"
   },
   {
     "code": "minimum-error",
     "schema": {
       "minimum": 5
     },
-    "data": 4
+    "data": 4,
+    "schemaPath": "#/minimum"
   },
   {
     "code": "missing-dependency-error",
@@ -300,7 +334,8 @@
     "dialects": ["draft-07"],
     "data": {
       "a": 1
-    }
+    },
+    "schemaPath": "#/dependencies"
   },
   {
     "code": "missing-dependency-error",
@@ -312,14 +347,16 @@
     "dialects": ["2019-09", "2020-12"],
     "data": {
       "a": 1
-    }
+    },
+    "schemaPath": "#/dependentRequired"
   },
   {
     "code": "multiple-of-error",
     "schema": {
       "multipleOf": 3
     },
-    "data": 4
+    "data": 4,
+    "schemaPath": "#/multipleOf"
   },
   {
     "code": "multiple-one-of-error",
@@ -333,7 +370,8 @@
         }
       ]
     },
-    "data": 1
+    "data": 1,
+    "schemaPath": "#/oneOf"
   },
   {
     "code": "no-additional-properties-error",
@@ -351,7 +389,8 @@
         "extra": 1
       }
     },
-    "instancePath": "/o"
+    "instancePath": "/o",
+    "schemaPath": "#/properties/o/additionalProperties"
   },
   {
     "code": "not-error",
@@ -360,7 +399,8 @@
         "type": "string"
       }
     },
-    "data": "a"
+    "data": "a",
+    "schemaPath": "#/not"
   },
   {
     "code": "one-of-error",
@@ -374,28 +414,32 @@
         }
       ]
     },
-    "data": true
+    "data": true,
+    "schemaPath": "#/oneOf"
   },
   {
     "code": "pattern-error",
     "schema": {
       "pattern": "^a"
     },
-    "data": "b"
+    "data": "b",
+    "schemaPath": "#/pattern"
   },
   {
     "code": "required-property-error",
     "schema": {
       "required": ["a"]
     },
-    "data": {}
+    "data": {},
+    "schemaPath": "#/required"
   },
   {
     "code": "type-error",
     "schema": {
       "type": "string"
     },
-    "data": 5
+    "data": 5,
+    "schemaPath": "#/type"
   },
   {
     "code": "type-error",
@@ -403,7 +447,8 @@
     "schema": {
       "type": ["string", "number"]
     },
-    "data": true
+    "data": true,
+    "schemaPath": "#/type"
   },
   {
     "code": "unevaluated-items-error",
@@ -411,7 +456,8 @@
     "schema": {
       "unevaluatedItems": false
     },
-    "data": [1]
+    "data": [1],
+    "schemaPath": "#/unevaluatedItems"
   },
   {
     "code": "unevaluated-property-error",
@@ -426,21 +472,24 @@
     "data": {
       "a": 1,
       "top": 1
-    }
+    },
+    "schemaPath": "#/unevaluatedProperties"
   },
   {
     "code": "unique-items-error",
     "schema": {
       "uniqueItems": true
     },
-    "data": [1, 2, 1]
+    "data": [1, 2, 1],
+    "schemaPath": "#/uniqueItems"
   },
   {
     "code": "x-gts-ref",
     "schema": {
       "x-gts-ref": "gts.acme.core.events.a.v1~"
     },
-    "data": "gts.acme.core.events.b.v1~"
+    "data": "gts.acme.core.events.b.v1~",
+    "schemaPath": "#/x-gts-ref"
   },
   {
     "code": "contains-min-error",
@@ -453,7 +502,8 @@
       "minContains": 2,
       "maxContains": 3
     },
-    "data": ["a"]
+    "data": ["a"],
+    "schemaPath": "#/contains"
   },
   {
     "code": "contains-min-error",
@@ -464,7 +514,8 @@
       }
     },
     "data": [1],
-    "omitParams": ["maxContains"]
+    "omitParams": ["maxContains"],
+    "schemaPath": "#/contains"
   },
   {
     "code": "invalid-data-error",
@@ -477,7 +528,8 @@
     "data": {
       "a": 1
     },
-    "instancePath": "/a"
+    "instancePath": "/a",
+    "schemaPath": "#/properties/a/false schema"
   },
   {
     "code": "unique-items-error",
@@ -492,7 +544,8 @@
     "data": {
       "l": ["x", "y", "x"]
     },
-    "instancePath": "/l"
+    "instancePath": "/l",
+    "schemaPath": "#/properties/l/uniqueItems"
   },
   {
     "code": "unevaluated-items-error",
@@ -502,7 +555,8 @@
       "prefixItems": [{}],
       "unevaluatedItems": false
     },
-    "data": [1, 2]
+    "data": [1, 2],
+    "schemaPath": "#/unevaluatedItems"
   },
   {
     "code": "additional-items-error",
@@ -523,7 +577,8 @@
     "data": {
       "l": ["a", 1]
     },
-    "instancePath": "/l"
+    "instancePath": "/l",
+    "schemaPath": "#/properties/l/additionalItems"
   },
   {
     "code": "unevaluated-property-error",
@@ -546,7 +601,8 @@
         "top": 1
       }
     },
-    "instancePath": "/o"
+    "instancePath": "/o",
+    "schemaPath": "#/properties/o/unevaluatedProperties"
   },
   {
     "code": "unevaluated-items-error",
@@ -562,7 +618,8 @@
     "data": {
       "l": [1]
     },
-    "instancePath": "/l"
+    "instancePath": "/l",
+    "schemaPath": "#/properties/l/unevaluatedItems"
   },
   {
     "code": "type-error",
@@ -579,7 +636,8 @@
     "data": {
       "a": [1]
     },
-    "instancePath": "/a/0"
+    "instancePath": "/a/0",
+    "schemaPath": "#/properties/a/items/type"
   },
   {
     "code": "required-property-error",
@@ -594,6 +652,70 @@
     "data": {
       "o": {}
     },
-    "instancePath": "/o"
+    "instancePath": "/o",
+    "schemaPath": "#/properties/o/required"
+  },
+  {
+    "code": "format-iso-time-error",
+    "format": "iso-time",
+    "schema": {
+      "format": "iso-time"
+    },
+    "data": "nope",
+    "schemaPath": "#/format"
+  },
+  {
+    "code": "format-iso-date-time-error",
+    "format": "iso-date-time",
+    "schema": {
+      "format": "iso-date-time"
+    },
+    "data": "nope",
+    "schemaPath": "#/format"
+  },
+  {
+    "code": "format-json-pointer-uri-fragment-error",
+    "format": "json-pointer-uri-fragment",
+    "schema": {
+      "format": "json-pointer-uri-fragment"
+    },
+    "data": "nope",
+    "schemaPath": "#/format"
+  },
+  {
+    "code": "format-relative-json-pointer-error",
+    "format": "relative-json-pointer",
+    "schema": {
+      "format": "relative-json-pointer"
+    },
+    "data": "nope",
+    "schemaPath": "#/format"
+  },
+  {
+    "code": "format-byte-error",
+    "format": "byte",
+    "schema": {
+      "format": "byte"
+    },
+    "data": "@@@@",
+    "schemaPath": "#/format"
+  },
+  {
+    "code": "format-int32-error",
+    "format": "int32",
+    "schema": {
+      "format": "int32"
+    },
+    "data": 2147483648,
+    "schemaPath": "#/format"
+  },
+  {
+    "code": "format-int64-error",
+    "format": "int64",
+    "schema": {
+      "format": "int64"
+    },
+    "data": 1.5,
+    "schemaPath": "#/format"
   }
 ]

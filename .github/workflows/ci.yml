@@ -268,4 +268,4 @@ jobs:
         run: npm run build
 
       - name: Performance gate (thresholds in bench/thresholds.json)
-        run: npm run bench
+        run: npm run bench -- --runs 5
