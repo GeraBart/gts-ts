@@ -59,11 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Remove `ajv` and `ajv-formats` from the runtime dependencies (`ajv` stays as a devDependency, used only as a test oracle) and add `json-schema-library` pinned to exactly `11.6.14`.
-- Cache the compiled schema per store and per entity version; the cache is cleared on every schema registration, replacement, removal, staging commit or discard, and its size is bounded by the number of registered entities.
+- Cache the compiled schema per store and per entity version; the cache is cleared on schema pool changes (a schema added, replaced or removed, including through staging), and its size is bounded by the number of registered entities.
 - Add a CSP static scan, a no-codegen jest run, a headless Chromium test under a strict CSP and a benchmark performance gate to CI.
 - All formats asserted by ajv-formats 3.0.1 `full` mode are asserted by built-in checkers with ajv-formats semantics (e.g. `""` fails `email`, `uuid`, `date` and `url`); GTS `date-time`, `time` and `regex` checkers are unchanged; `float`, `double`, `password` and `binary` stay non-asserting, as in ajv-formats.
 - Closed schemas (`additionalProperties: false`, also with `patternProperties`, and `unevaluatedProperties`) reject undeclared keys named like `Object.prototype` members (`constructor`, `toString`, `__proto__`, `hasOwnProperty`), same as Ajv.
-- Normalized registered schemas are cached alongside compiled schemas (cleared on any pool mutation). The CI performance gate runs `npm run bench -- --runs 5` and gates on the median of per-run medians (`scripts/bench.mjs --runs <n>`).
+- Normalized registered schemas are cached alongside compiled schemas (cleared on schema pool changes). The CI performance gate runs `npm run bench -- --runs 5` and gates on the median of per-run medians (`scripts/bench.mjs --runs <n>`).
 
 ### Security
 

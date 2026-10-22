@@ -632,8 +632,8 @@ export interface CompiledSchema {
 export interface SchemaEngine {
   /** Register (or replace) a schema in its dialect's `$ref` pool under `id`. */
   addEngineSchema(schema: Record<string, any>, id: string): void;
-  /** Remove `id` from every dialect pool. */
-  removeEngineSchema(id: string): void;
+  /** Remove `id` from every dialect pool; returns true iff an entry was removed (the compiled cache is cleared only then). */
+  removeEngineSchema(id: string): boolean;
   /** Drop `id` from the pools, then re-add `schema` when given. */
   refreshEngineForKey(id: string, schema?: Record<string, any>): void;
   /**
@@ -738,10 +738,15 @@ export function createSchemaEngine(options: SchemaEngineOptions): SchemaEngine {
       cache.clear();
     },
     removeEngineSchema(id) {
+      let removed = false;
       for (const dialect of Object.keys(pools) as SchemaDialect[]) {
-        if (pools[dialect].delete(id)) delete hosts[dialect];
+        if (pools[dialect].delete(id)) {
+          delete hosts[dialect];
+          removed = true;
+        }
       }
-      cache.clear();
+      if (removed) cache.clear();
+      return removed;
     },
     refreshEngineForKey(id, schema) {
       this.removeEngineSchema(id);

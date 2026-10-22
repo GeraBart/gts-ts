@@ -111,7 +111,7 @@ describe('F4: normalization is skipped for cached compiled schemas', () => {
     gts.validateInstance(instId);
     gts.validateInstance(instId);
     expect(spy).toHaveBeenCalledTimes(1);
-    store.removeEngineSchema('gts.x.unit.other.v1~');
+    store.removeEngineSchema(schema.$id);
     gts.validateInstance(instId);
     expect(spy).toHaveBeenCalledTimes(2);
     store.addEngineSchema(store.get(schema.$id));

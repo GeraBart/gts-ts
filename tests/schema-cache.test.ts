@@ -134,4 +134,41 @@ describe('compiled schema cache', () => {
     expect(one.validateInstance(instanceId).ok).toBe(true);
     expect(cacheSize(one)).toBe(1);
   });
+
+  test('staging, committing and discarding an instance keep both caches warm', () => {
+    const store = setup();
+    const spy = jest.spyOn(store as any, 'normalizeSchema');
+    expect(store.validateInstance(instanceId).ok).toBe(true);
+    const calls = spy.mock.calls.length;
+    expect(cacheSize(store)).toBe(1);
+
+    const otherId = `${idA}x.unit._.other.v1`;
+    const t1 = store.stage(createJsonEntity({ id: otherId, value: 'a' }));
+    expect(cacheSize(store)).toBe(1);
+    store.discard(t1);
+    expect(cacheSize(store)).toBe(1);
+    const t2 = store.stage(createJsonEntity({ id: otherId, value: 'b' }));
+    store.commit(t2);
+    expect(cacheSize(store)).toBe(1);
+
+    expect(store.validateInstance(instanceId).ok).toBe(true);
+    expect(store.validateInstance(otherId).ok).toBe(true);
+    expect(spy.mock.calls.length).toBe(calls);
+    expect(cacheSize(store)).toBe(1);
+  });
+
+  test('engine removeEngineSchema reports whether a pool entry was removed', () => {
+    const engine = (setup() as any).engine as SchemaEngine;
+    expect(engine.removeEngineSchema('gts.x.unit.cache.absent.v1~')).toBe(false);
+    expect(engine.removeEngineSchema('gts.x.unit.cache.b.v1~')).toBe(true);
+    expect(engine.removeEngineSchema('gts.x.unit.cache.b.v1~')).toBe(false);
+  });
+
+  test('unregistering a referenced schema clears the cache', () => {
+    const store = setup();
+    expect(store.validateInstance(instanceId).ok).toBe(true);
+    expect(cacheSize(store)).toBe(1);
+    store.unregister('gts.x.unit.cache.b.v1~');
+    expect(cacheSize(store)).toBe(0);
+  });
 });

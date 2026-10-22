@@ -118,9 +118,10 @@ export class GtsStore {
     }
   }
 
-  private removeEngineSchema(id: string): void {
-    this.normalizedSchemaCache.clear();
-    this.engine.removeEngineSchema(id);
+  private removeEngineSchema(id: string): boolean {
+    const removed = this.engine.removeEngineSchema(id);
+    if (removed) this.normalizedSchemaCache.clear();
+    return removed;
   }
 
   /**
