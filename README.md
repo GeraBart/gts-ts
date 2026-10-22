@@ -198,6 +198,29 @@ gts.query('gts.vendor.* AND NOT gts.vendor.test.*');
 gts.query('(gts.vendor.* OR gts.other.*) AND gts.*.*.ns.*');
 ```
 
+## Content Security Policy
+
+The core library (the `dist/index.js` closure) validates schemas by interpretation and never compiles them to code, so it runs under this strict policy without `'unsafe-eval'` or `'wasm-unsafe-eval'`:
+
+```
+script-src 'self'; object-src 'none'; base-uri 'none'; worker-src 'none'; require-trusted-types-for 'script'; trusted-types 'none'
+```
+
+The core library creates no Trusted Types policies, starts no workers and makes no network fetches. This is checked in CI by:
+
+- a static scan of the bundled dependency closure for code-generation sinks and DOM/network/worker APIs (`npm run csp:scan`);
+- a matrix of flagged validation scenarios and the issue reproduction run under `node --disallow-code-generation-from-strings`;
+- the jest suite in a no-codegen environment (`npm run test:csp`);
+- a headless Chromium test that loads the core bundle under the full header above and asserts zero `securitypolicyviolation` events (`npm run test:csp:browser`).
+
+The browser test bundle differs from a plain bundle in three ways (test harness only, `src/` is unchanged):
+
+- Node `crypto` is aliased to a pure-JavaScript synchronous SHA-256 shim (`tests/csp/sha256-shim.js`, `createHash('sha256')` only). The shim is part of the scan scope.
+- Node `path` is marked `external`; it is used only inside the issue reproduction's `require.main` guard and is inert in the browser.
+- `jsonc-parser` is aliased to its ES-module build (`lib/esm/main.js`), because esbuild would otherwise pick the UMD build, whose dynamic `require` fails at runtime. Bundlers that honor the package `module` field are not affected.
+
+The `server/` and CLI entry points are out of scope: the Fastify server keeps its own Ajv and is Node-only.
+
 ## CLI Usage
 
 The package includes a CLI tool for GTS operations:

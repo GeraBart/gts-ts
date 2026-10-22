@@ -1,0 +1,599 @@
+[
+  {
+    "code": "additional-items-error",
+    "dialects": ["draft-07", "2019-09"],
+    "schema": {
+      "items": [
+        {
+          "type": "string"
+        }
+      ],
+      "additionalItems": false
+    },
+    "data": ["a", 1]
+  },
+  {
+    "code": "type-error",
+    "schema": {
+      "allOf": [
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "data": 5,
+    "label": "inside allOf (the library reports the inner error, as Ajv does)"
+  },
+  {
+    "code": "any-of-error",
+    "schema": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        }
+      ]
+    },
+    "data": true
+  },
+  {
+    "code": "const-error",
+    "schema": {
+      "const": 1
+    },
+    "data": 2
+  },
+  {
+    "code": "contains-max-error",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "contains": {
+        "type": "string"
+      },
+      "maxContains": 1
+    },
+    "data": ["a", "b"]
+  },
+  {
+    "code": "contains-min-error",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "contains": {
+        "type": "string"
+      },
+      "minContains": 2
+    },
+    "data": ["a"],
+    "omitParams": ["maxContains"]
+  },
+  {
+    "code": "enum-error",
+    "schema": {
+      "enum": ["a", "b"]
+    },
+    "data": "c"
+  },
+  {
+    "code": "exclusive-maximum-error",
+    "schema": {
+      "exclusiveMaximum": 5
+    },
+    "data": 5
+  },
+  {
+    "code": "exclusive-minimum-error",
+    "schema": {
+      "exclusiveMinimum": 5
+    },
+    "data": 5
+  },
+  {
+    "code": "format-date-error",
+    "format": "date",
+    "schema": {
+      "format": "date"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-date-time-error",
+    "format": "date-time",
+    "schema": {
+      "format": "date-time"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-duration-error",
+    "format": "duration",
+    "schema": {
+      "format": "duration"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-email-error",
+    "format": "email",
+    "schema": {
+      "format": "email"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-hostname-error",
+    "format": "hostname",
+    "schema": {
+      "format": "hostname"
+    },
+    "data": "-bad-"
+  },
+  {
+    "code": "format-ipv4-error",
+    "format": "ipv4",
+    "schema": {
+      "format": "ipv4"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-ipv6-error",
+    "format": "ipv6",
+    "schema": {
+      "format": "ipv6"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-json-pointer-error",
+    "format": "json-pointer",
+    "schema": {
+      "format": "json-pointer"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-regex-error",
+    "format": "regex",
+    "schema": {
+      "format": "regex"
+    },
+    "data": "("
+  },
+  {
+    "code": "format-time-error",
+    "format": "time",
+    "schema": {
+      "format": "time"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-uri-error",
+    "format": "uri",
+    "schema": {
+      "format": "uri"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-uri-reference-error",
+    "format": "uri-reference",
+    "schema": {
+      "format": "uri-reference"
+    },
+    "data": "http://[bad"
+  },
+  {
+    "code": "format-uri-template-error",
+    "format": "uri-template",
+    "schema": {
+      "format": "uri-template"
+    },
+    "data": "{bad"
+  },
+  {
+    "code": "format-url-error",
+    "format": "url",
+    "schema": {
+      "format": "url"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "format-uuid-error",
+    "format": "uuid",
+    "schema": {
+      "format": "uuid"
+    },
+    "data": "nope"
+  },
+  {
+    "code": "invalid-data-error",
+    "dialects": ["2020-12"],
+    "schema": {
+      "type": "array",
+      "items": false
+    },
+    "data": [1]
+  },
+  {
+    "code": "invalid-property-name-error",
+    "schema": {
+      "propertyNames": {
+        "pattern": "^a"
+      }
+    },
+    "data": {
+      "b": 1
+    }
+  },
+  {
+    "code": "max-items-error",
+    "schema": {
+      "maxItems": 1
+    },
+    "data": [1, 2]
+  },
+  {
+    "code": "max-length-error",
+    "schema": {
+      "maxLength": 1
+    },
+    "data": "ab"
+  },
+  {
+    "code": "max-properties-error",
+    "schema": {
+      "maxProperties": 1
+    },
+    "data": {
+      "a": 1,
+      "b": 2
+    }
+  },
+  {
+    "code": "maximum-error",
+    "schema": {
+      "maximum": 5
+    },
+    "data": 6
+  },
+  {
+    "code": "min-items-error",
+    "schema": {
+      "minItems": 2
+    },
+    "data": [1]
+  },
+  {
+    "code": "min-length-error",
+    "schema": {
+      "minLength": 2
+    },
+    "data": "a"
+  },
+  {
+    "code": "min-properties-error",
+    "schema": {
+      "minProperties": 2
+    },
+    "data": {
+      "a": 1
+    }
+  },
+  {
+    "code": "minimum-error",
+    "schema": {
+      "minimum": 5
+    },
+    "data": 4
+  },
+  {
+    "code": "missing-dependency-error",
+    "schema": {
+      "dependencies": {
+        "a": ["b"]
+      }
+    },
+    "dialects": ["draft-07"],
+    "data": {
+      "a": 1
+    }
+  },
+  {
+    "code": "missing-dependency-error",
+    "schema": {
+      "dependentRequired": {
+        "a": ["b"]
+      }
+    },
+    "dialects": ["2019-09", "2020-12"],
+    "data": {
+      "a": 1
+    }
+  },
+  {
+    "code": "multiple-of-error",
+    "schema": {
+      "multipleOf": 3
+    },
+    "data": 4
+  },
+  {
+    "code": "multiple-one-of-error",
+    "schema": {
+      "oneOf": [
+        {
+          "type": "number"
+        },
+        {
+          "minimum": 0
+        }
+      ]
+    },
+    "data": 1
+  },
+  {
+    "code": "no-additional-properties-error",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "o": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      }
+    },
+    "data": {
+      "o": {
+        "extra": 1
+      }
+    },
+    "instancePath": "/o"
+  },
+  {
+    "code": "not-error",
+    "schema": {
+      "not": {
+        "type": "string"
+      }
+    },
+    "data": "a"
+  },
+  {
+    "code": "one-of-error",
+    "schema": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        }
+      ]
+    },
+    "data": true
+  },
+  {
+    "code": "pattern-error",
+    "schema": {
+      "pattern": "^a"
+    },
+    "data": "b"
+  },
+  {
+    "code": "required-property-error",
+    "schema": {
+      "required": ["a"]
+    },
+    "data": {}
+  },
+  {
+    "code": "type-error",
+    "schema": {
+      "type": "string"
+    },
+    "data": 5
+  },
+  {
+    "code": "type-error",
+    "label": "type array",
+    "schema": {
+      "type": ["string", "number"]
+    },
+    "data": true
+  },
+  {
+    "code": "unevaluated-items-error",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "unevaluatedItems": false
+    },
+    "data": [1]
+  },
+  {
+    "code": "unevaluated-property-error",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "type": "object",
+      "properties": {
+        "a": {}
+      },
+      "unevaluatedProperties": false
+    },
+    "data": {
+      "a": 1,
+      "top": 1
+    }
+  },
+  {
+    "code": "unique-items-error",
+    "schema": {
+      "uniqueItems": true
+    },
+    "data": [1, 2, 1]
+  },
+  {
+    "code": "x-gts-ref",
+    "schema": {
+      "x-gts-ref": "gts.acme.core.events.a.v1~"
+    },
+    "data": "gts.acme.core.events.b.v1~"
+  },
+  {
+    "code": "contains-min-error",
+    "label": "with maxContains",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "contains": {
+        "type": "string"
+      },
+      "minContains": 2,
+      "maxContains": 3
+    },
+    "data": ["a"]
+  },
+  {
+    "code": "contains-min-error",
+    "label": "default minContains",
+    "schema": {
+      "contains": {
+        "type": "string"
+      }
+    },
+    "data": [1],
+    "omitParams": ["maxContains"]
+  },
+  {
+    "code": "invalid-data-error",
+    "label": "properties false schema",
+    "schema": {
+      "properties": {
+        "a": false
+      }
+    },
+    "data": {
+      "a": 1
+    },
+    "instancePath": "/a"
+  },
+  {
+    "code": "unique-items-error",
+    "label": "nested",
+    "schema": {
+      "properties": {
+        "l": {
+          "uniqueItems": true
+        }
+      }
+    },
+    "data": {
+      "l": ["x", "y", "x"]
+    },
+    "instancePath": "/l"
+  },
+  {
+    "code": "unevaluated-items-error",
+    "label": "after prefix",
+    "dialects": ["2020-12"],
+    "schema": {
+      "prefixItems": [{}],
+      "unevaluatedItems": false
+    },
+    "data": [1, 2]
+  },
+  {
+    "code": "additional-items-error",
+    "label": "nested",
+    "dialects": ["draft-07", "2019-09"],
+    "schema": {
+      "properties": {
+        "l": {
+          "items": [
+            {
+              "type": "string"
+            }
+          ],
+          "additionalItems": false
+        }
+      }
+    },
+    "data": {
+      "l": ["a", 1]
+    },
+    "instancePath": "/l"
+  },
+  {
+    "code": "unevaluated-property-error",
+    "label": "nested",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "properties": {
+        "o": {
+          "type": "object",
+          "properties": {
+            "a": {}
+          },
+          "unevaluatedProperties": false
+        }
+      }
+    },
+    "data": {
+      "o": {
+        "a": 1,
+        "top": 1
+      }
+    },
+    "instancePath": "/o"
+  },
+  {
+    "code": "unevaluated-items-error",
+    "label": "nested",
+    "dialects": ["2019-09", "2020-12"],
+    "schema": {
+      "properties": {
+        "l": {
+          "unevaluatedItems": false
+        }
+      }
+    },
+    "data": {
+      "l": [1]
+    },
+    "instancePath": "/l"
+  },
+  {
+    "code": "type-error",
+    "label": "nested array item",
+    "schema": {
+      "properties": {
+        "a": {
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "data": {
+      "a": [1]
+    },
+    "instancePath": "/a/0"
+  },
+  {
+    "code": "required-property-error",
+    "label": "nested",
+    "schema": {
+      "properties": {
+        "o": {
+          "required": ["k"]
+        }
+      }
+    },
+    "data": {
+      "o": {}
+    },
+    "instancePath": "/o"
+  }
+]

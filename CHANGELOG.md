@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-10-22
+
+### Breaking
+
+- Replace Ajv with [json-schema-library](https://github.com/sagold/json-schema-library) (exact pin `11.6.14`) as the JSON Schema engine of the core library. Draft-07, 2019-09 and 2020-12 remain supported.
+- The wording and order of `error` and `errors[].message` change: messages now come from the new engine and no longer reproduce Ajv's text. The `params` object changes as well: it carries Ajv-style keys from an explicit adapter table, and the internal `pointer` key is no longer present.
+- `keyword`, `instancePath` and `params` keys are unchanged for the 45 issue codes verified against an Ajv 8 oracle (161 probes across the three dialects), with these exceptions, which are changed:
+  - `invalid-data-error` (2020-12, `items: false`): `instancePath` is the array (`/`), Ajv reported each item (`/0`).
+  - `missing-dependency-error`: `params` no longer carries Ajv's extra `property`, `depsCount` and `deps` keys.
+- Error count can differ from Ajv's: Ajv's sub-errors before `anyOf` and `propertyNames` wrappers are not emitted, the wrapper issue is identical.
+- Unchanged: `ok` / `valid`, the `JSON Schema validation failed:` prefix, the `is not of type '...'` substring, and the exported `ValidationIssue` / `ValidationResult` types.
+
+### Changed
+
+- Remove `ajv` and `ajv-formats` from the runtime dependencies (`ajv` stays as a devDependency, used only as a test oracle) and add `json-schema-library` pinned to exactly `11.6.14`.
+- Cache the compiled schema per store and per entity version; the cache is cleared on every schema registration, replacement, removal, staging commit or discard, and its size is bounded by the number of registered entities.
+- Add a CSP static scan, a no-codegen jest run, a headless Chromium test under a strict CSP and a benchmark performance gate to CI.
+- Standard `uri`, `uri-reference`, `uri-template`, `hostname`, `ipv4` and `ipv6` formats are now asserted by built-in checkers.
+
+### Security
+
+- The core library no longer needs `'unsafe-eval'` or `'wasm-unsafe-eval'` and is compatible with Content Security Policy and Trusted Types (`require-trusted-types-for 'script'`, `trusted-types 'none'`): runtime schemas are validated by interpretation and never compiled to code. See the README "Content Security Policy" section. The `server/` and `cli/` entry points are out of scope (the Fastify server keeps its own Ajv).
+- Fix unbounded memory growth on repeated validation: Ajv's per-call recompilation of schemas grew its internal cache without bound. Measured over 5,000 calls (heap after GC): `validateInstance` 347.914 MB before, 0.490 MB after; `validateTransientInstance` 185.282 MB before, 0.073 MB after.
+
+### Fixed
+
+- Core validation failed under a CSP without `'unsafe-eval'` and under `node --disallow-code-generation-from-strings` with `Code generation from strings disallowed for this context` (#28).
+
 ## [0.9.0] - 2026-10-09
 
 ### Breaking
